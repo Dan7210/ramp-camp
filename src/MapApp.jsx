@@ -12,13 +12,9 @@ import LineString from 'ol/geom/LineString';
 import Overlay from 'ol/Overlay';
 import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
-import './MapApp.css';
 
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter'
-];
+import faaAirports from './airports.json';
+import './MapApp.css';
 
 const KPDK_COORDS = [-84.3020, 33.8756];
 
@@ -204,50 +200,15 @@ export default function MapApp() {
     return () => initialMap.setTarget(null);
   }, []);
 
-  const handleClearResults = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-
-    setLoading(false);
-    setIsLocked(false);
-    setCachedData(null);
-    setResults({ airports: [], campsites: [] });
-    
-    setMaxQueriedAirportRadius(150);
-    setMaxQueriedCampRadius(50);
-
-    vectorSourceRef.current.clear();
-    updateOriginMarker(centerCoords);
-    if (overlayRef.current) overlayRef.current.setPosition(undefined);
-    setStatusLog('Results cleared. Origin dot unlocked.');
-  };
-
-  const isPublicAirport = (tags) => {
-    const access = (tags.access || '').toLowerCase();
-    const aeroway = (tags.aeroway || '').toLowerCase();
-    const type = (tags.type || '').toLowerCase();
-    const operator = (tags.operator || '').toLowerCase();
-    const fee = (tags.fee || '').toLowerCase();
-
-    if (['private', 'no', 'permissive', 'restricted', 'military'].includes(access)) {
-      return false;
-    }
-    
-    if (tags.military || aeroway === 'military' || type === 'military') {
-      return false;
-    }
-
-    if (operator.includes('private') || operator.includes('usaf') || operator.includes('army') || operator.includes('navy')) {
-      return false;
-    }
-
-    if (access === 'public' || access === 'yes' || fee === 'yes' || tags.icao || tags['ref:icao']) {
-      return true;
-    }
-
-    return true; 
+  const getDistanceInMeters = (lon1, lat1, lon2, lat2) => {
+    const R = 6371000;
+    const rad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * rad;
+    const dLon = (lon2 - lon1) * rad;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
   const getRoadRoute = async (startLon, startLat, endLon, endLat, signal) => {
@@ -273,22 +234,45 @@ export default function MapApp() {
     };
   };
 
-  const getDistanceInMeters = (lon1, lat1, lon2, lat2) => {
-    const R = 6371000;
-    const rad = Math.PI / 180;
-    const dLat = (lat2 - lat1) * rad;
-    const dLon = (lon2 - lon1) * rad;
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  // Fast Bounding Box Calculation for a single area-of-interest query
+  const getAreaBoundingBox = (lat, lon, airportRadiusNM, campRadiusMiles) => {
+    const totalMeters = (airportRadiusNM * 1852) + (campRadiusMiles * 1609.34);
+    const latDelta = totalMeters / 111139;
+    const lonDelta = totalMeters / (111139 * Math.cos(lat * (Math.PI / 180)));
+
+    const south = (lat - latDelta).toFixed(4);
+    const north = (lat + latDelta).toFixed(4);
+    const west = (lon - lonDelta).toFixed(4);
+    const east = (lon + lonDelta).toFixed(4);
+
+    return `${south},${west},${north},${east}`;
+  };
+
+  const fetchAreaCampsites = async (bbox, signal) => {
+    const query = `[out:json][timeout:25];(node["tourism"="camp_site"](${bbox});way["tourism"="camp_site"](${bbox}););out center;`;
+    
+    const endpoints = [
+      `/overpass?data=${encodeURIComponent(query)}`,
+      `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`,
+      `https://lz4.overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`
+    ];
+
+    for (const url of endpoints) {
+      try {
+        const res = await fetch(url, { signal });
+        if (res.ok) return await res.json();
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;
+      }
+    }
+    return null;
   };
 
   const handleSearch = async () => {
     setLoading(true);
     setIsLocked(true);
-    setStatusLog('Querying spatial airport and campsite data...');
-    
+    setStatusLog('Filtering FAA airports from local dataset...');
+
     vectorSourceRef.current.clear();
     updateOriginMarker(centerCoords);
     if (overlayRef.current) overlayRef.current.setPosition(undefined);
@@ -297,107 +281,86 @@ export default function MapApp() {
     abortControllerRef.current = controller;
 
     const [lon, lat] = centerCoords;
-    const searchAirportRadiusMeters = airportRadiusMiles * 1609.34;
     const searchCampRadiusMeters = campRadiusMiles * 1609.34;
-    const totalSearchRadius = searchAirportRadiusMeters + searchCampRadiusMeters;
 
-    let overpassQuery = `[out:json][timeout:45];\n(\n`;
-    overpassQuery += `  node["aeroway"="aerodrome"](around:${searchAirportRadiusMeters},${lat},${lon});\n`;
-    overpassQuery += `  way["aeroway"="aerodrome"](around:${searchAirportRadiusMeters},${lat},${lon});\n`;
-    overpassQuery += `  node["tourism"="camp_site"](around:${totalSearchRadius},${lat},${lon});\n`;
-    overpassQuery += `  way["tourism"="camp_site"](around:${totalSearchRadius},${lat},${lon});\n`;
-    overpassQuery += `);\nout center;`;
+    // STEP 1: Filter CSV airports first in local memory
+    const matchingAirports = faaAirports.filter((apt) => {
+      const distMeters = getDistanceInMeters(lon, lat, apt.lon, apt.lat);
+      const distNM = distMeters / 1852;
+      if (distNM > airportRadiusMiles) return false;
 
-    let data = null;
-    for (const endpoint of OVERPASS_ENDPOINTS) {
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `data=${encodeURIComponent(overpassQuery)}`,
-          signal: controller.signal
-        });
-        if (response.ok) {
-          data = await response.json();
-          break;
-        }
-      } catch (err) {
-        if (err.name === 'AbortError') {
-          setStatusLog('Search cancelled by user.');
-          return;
-        }
-      }
-    }
+      if (accessFilter === 'public' && !apt.isPublic) return false;
+      if (accessFilter === 'private' && apt.isPublic) return false;
 
-    if (!data || !data.elements) {
-      setStatusLog('Search failed: Overpass server unresponsive.');
+      const surfaceLower = apt.surface.toLowerCase();
+      const isPaved = surfaceLower.includes('asph') || surfaceLower.includes('conc') || surfaceLower.includes('paved');
+      if (surfaceFilter === 'paved' && !isPaved) return false;
+      if (surfaceFilter === 'unpaved' && isPaved) return false;
+
+      if (minRunwayLength > 0 && apt.lengthFeet > 0 && apt.lengthFeet < minRunwayLength) return false;
+
+      apt.distFromCenterNM = distNM;
+      return true;
+    });
+
+    if (matchingAirports.length === 0) {
+      setStatusLog('No FAA airports match your criteria in this radius.');
       setLoading(false);
       return;
     }
 
-    const airportsRaw = [];
-    const campsitesRaw = [];
+    // STEP 2: Single Bounding Box query to Overpass for all area campsites
+    setStatusLog(`Querying regional campsites for ${matchingAirports.length} candidate airports...`);
+    const bbox = getAreaBoundingBox(lat, lon, airportRadiusMiles, campRadiusMiles);
+    const campsiteData = await fetchAreaCampsites(bbox, controller.signal);
 
-    data.elements.forEach((elem) => {
-      const eLat = elem.lat || elem.center?.lat;
-      const eLon = elem.lon || elem.center?.lon;
-      if (!eLat || !eLon) return;
+    if (!campsiteData) {
+      setStatusLog('Campsite query failed or timed out. Try reducing search radius.');
+      setLoading(false);
+      return;
+    }
 
-      const tags = elem.tags || {};
-      const name = tags.name || tags['seamark:name'] || 'Unnamed Facility';
+    const allCampsites = (campsiteData.elements || [])
+      .map((elem) => ({
+        id: elem.id,
+        name: elem.tags?.name || 'Unnamed Campsite',
+        lat: elem.lat || elem.center?.lat,
+        lon: elem.lon || elem.center?.lon,
+        fee: elem.tags?.fee || 'Unknown',
+        capacity: elem.tags?.capacity || 'N/A'
+      }))
+      .filter((c) => c.lat && c.lon);
 
-      if (tags.aeroway === 'aerodrome') {
-        const surface = tags.surface || tags['aeroway:surface'] || 'Unknown';
-        const isPublic = isPublicAirport(tags);
-        const access = isPublic ? 'Public' : 'Private';
-        const lengthFeet = tags.length ? Math.round(parseFloat(tags.length) * (tags.length.includes('m') ? 3.28084 : 1)) : 0;
-        const icao = tags.icao || tags['ref:icao'] || tags.ident || 'N/A';
-        const distFromCenterNM = (getDistanceInMeters(lon, lat, eLon, eLat) / 1852);
+    setStatusLog(`Evaluating driving connections across ${allCampsites.length} campsites...`);
 
-        airportsRaw.push({
-          id: elem.id,
-          name,
-          lat: eLat,
-          lon: eLon,
-          surface,
-          access,
-          isPublic,
-          lengthFeet,
-          icao,
-          distFromCenterNM
-        });
-      } else if (tags.tourism === 'camp_site') {
-        const fee = tags.fee || 'Unknown';
-        const capacity = tags.capacity || 'N/A';
-        campsitesRaw.push({ id: elem.id, name, lat: eLat, lon: eLon, fee, capacity });
-      }
-    });
-
-    setStatusLog(`Pre-computing road paths for candidate facilities...`);
-
+    // STEP 3: Match campsites to airports locally using straight-line distance, then batch OSRM
     const evaluatedAirports = [];
-    for (const apt of airportsRaw) {
+
+    for (const apt of matchingAirports) {
       if (controller.signal.aborted) return;
-      
-      const nearbyCamps = [];
-      for (const camp of campsitesRaw) {
+
+      // Filter campsites near THIS specific airport
+      const nearbyCamps = allCampsites.filter((camp) => {
         const directMeters = getDistanceInMeters(apt.lon, apt.lat, camp.lon, camp.lat);
-        if (directMeters <= searchCampRadiusMeters * 1.5) {
-          nearbyCamps.push(camp);
-        }
-      }
+        return directMeters <= searchCampRadiusMeters;
+      });
 
-      const validRouteConnections = [];
-      for (const camp of nearbyCamps) {
-        if (controller.signal.aborted) return;
+      if (nearbyCamps.length === 0) continue;
+
+      const routePromises = nearbyCamps.map(async (camp) => {
         const route = await getRoadRoute(apt.lon, apt.lat, camp.lon, camp.lat, controller.signal);
-        validRouteConnections.push({ camp, route });
-      }
+        return { camp, route };
+      });
 
-      if (validRouteConnections.length > 0) {
+      const routeResults = await Promise.all(routePromises);
+      const validConnections = routeResults.filter(
+        ({ route }) => parseFloat(route.distanceMiles) <= campRadiusMiles
+      );
+
+      if (validConnections.length > 0) {
         evaluatedAirports.push({
           ...apt,
-          connections: validRouteConnections
+          connections: validConnections
         });
       }
     }
@@ -407,10 +370,10 @@ export default function MapApp() {
 
     const fullDataset = { origin: [lon, lat], airports: evaluatedAirports };
     setCachedData(fullDataset);
-    
+
     renderFilteredResults(fullDataset, airportRadiusMiles, campRadiusMiles, surfaceFilter, accessFilter, minRunwayLength);
 
-    setStatusLog(`Done. Displaying matching airports and campsites.`);
+    setStatusLog(`Done. Found ${evaluatedAirports.length} airports with nearby campsites.`);
     setLoading(false);
     abortControllerRef.current = null;
   };
@@ -432,7 +395,8 @@ export default function MapApp() {
       if (accessMode === 'public' && !apt.isPublic) return;
       if (accessMode === 'private' && apt.isPublic) return;
 
-      const isPaved = ['asphalt', 'concrete', 'paved'].includes(apt.surface.toLowerCase());
+      const surfaceLower = apt.surface.toLowerCase();
+      const isPaved = surfaceLower.includes('asph') || surfaceLower.includes('conc') || surfaceLower.includes('paved');
       if (surfaceMode === 'paved' && !isPaved) return;
       if (surfaceMode === 'unpaved' && isPaved) return;
 
@@ -491,6 +455,26 @@ export default function MapApp() {
 
     const matchedCampsites = Object.values(campsitesDict);
     setResults({ airports: validAirports, campsites: matchedCampsites });
+  };
+
+  const handleClearResults = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    setLoading(false);
+    setIsLocked(false);
+    setCachedData(null);
+    setResults({ airports: [], campsites: [] });
+    
+    setMaxQueriedAirportRadius(150);
+    setMaxQueriedCampRadius(50);
+
+    vectorSourceRef.current.clear();
+    updateOriginMarker(centerCoords);
+    if (overlayRef.current) overlayRef.current.setPosition(undefined);
+    setStatusLog('Results cleared. Origin unlocked.');
   };
 
   const handleAirportRadiusChange = (val) => {
@@ -599,10 +583,7 @@ export default function MapApp() {
           <button onClick={handleSearch} disabled={loading} className="btn-search">
             {loading ? 'Searching...' : 'Find Matches'}
           </button>
-          <button 
-            onClick={handleClearResults} 
-            className="btn-clear"
-          >
+          <button onClick={handleClearResults} className="btn-clear">
             Clear
           </button>
         </div>
@@ -638,7 +619,7 @@ export default function MapApp() {
                   <div>Surface: <strong>{tooltipData.details.surface}</strong></div>
                   <div>Access: <strong>{tooltipData.details.access}</strong></div>
                   {tooltipData.details.lengthFeet > 0 && (
-                    <div>Est. Length: <strong>{tooltipData.details.lengthFeet} ft</strong></div>
+                    <div>Primary Runway: <strong>{tooltipData.details.lengthFeet} ft</strong></div>
                   )}
                   <span className="ol-tooltip-badge badge-airport">Airport</span>
                 </div>
