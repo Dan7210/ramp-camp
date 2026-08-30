@@ -9,8 +9,10 @@ import OSM from 'ol/source/OSM';
 import Feature from 'ol/Feature';
 import Point from 'ol/geom/Point';
 import LineString from 'ol/geom/LineString';
+import Overlay from 'ol/Overlay';
 import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
+import './MapApp.css';
 
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
@@ -22,7 +24,9 @@ const KPDK_COORDS = [-84.3020, 33.8756];
 
 export default function MapApp() {
   const mapElement = useRef(null);
+  const tooltipElement = useRef(null);
   const mapRef = useRef(null);
+  const overlayRef = useRef(null);
   const vectorSourceRef = useRef(new VectorSource());
 
   const [centerCoords, setCenterCoords] = useState(KPDK_COORDS);
@@ -31,10 +35,11 @@ export default function MapApp() {
   const [surfaceFilter, setSurfaceFilter] = useState('any');
   const [accessFilter, setAccessFilter] = useState('any');
   const [minRunwayLength, setMinRunwayLength] = useState(0);
-  
+
   const [loading, setLoading] = useState(false);
-  const [statusLog, setStatusLog] = useState('Click anywhere on the map to place origin marker.');
+  const [statusLog, setStatusLog] = useState('Click anywhere on map to set origin marker.');
   const [results, setResults] = useState({ airports: [], campsites: [] });
+  const [tooltipData, setTooltipData] = useState(null);
 
   const updateOriginMarker = (coords) => {
     const features = vectorSourceRef.current.getFeatures();
@@ -131,9 +136,17 @@ export default function MapApp() {
       }
     });
 
+    const overlay = new Overlay({
+      element: tooltipElement.current,
+      offset: [0, -10],
+      positioning: 'bottom-center'
+    });
+    overlayRef.current = overlay;
+
     const initialMap = new Map({
       target: mapElement.current,
       layers: [new TileLayer({ source: new OSM() }), vectorLayer],
+      overlays: [overlay],
       view: new View({
         center: fromLonLat(KPDK_COORDS),
         zoom: 9
@@ -148,9 +161,44 @@ export default function MapApp() {
       updateOriginMarker(lonLat);
     });
 
+    initialMap.on('pointermove', (evt) => {
+      if (evt.dragging) {
+        overlay.setPosition(undefined);
+        return;
+      }
+
+      const feature = initialMap.forEachFeatureAtPixel(evt.pixel, (f) => f);
+      const featureType = feature?.get('type');
+
+      if (feature && (featureType === 'airport' || featureType === 'campsite')) {
+        const coordinates = feature.getGeometry().getCoordinates();
+        const payload = feature.get('payload');
+        
+        setTooltipData({
+          type: featureType,
+          name: feature.get('name'),
+          details: payload
+        });
+
+        overlay.setPosition(coordinates);
+        mapElement.current.style.cursor = 'pointer';
+      } else {
+        overlay.setPosition(undefined);
+        mapElement.current.style.cursor = '';
+      }
+    });
+
     mapRef.current = initialMap;
     return () => initialMap.setTarget(null);
   }, []);
+
+  const handleClearResults = () => {
+    vectorSourceRef.current.clear();
+    updateOriginMarker(centerCoords);
+    setResults({ airports: [], campsites: [] });
+    if (overlayRef.current) overlayRef.current.setPosition(undefined);
+    setStatusLog('Results cleared. Ready for search.');
+  };
 
   const getRoadRoute = async (startLon, startLat, endLon, endLat) => {
     try {
@@ -165,7 +213,7 @@ export default function MapApp() {
         return { coordinates, distanceMiles };
       }
     } catch (e) {
-      console.warn('OSRM routing failed, falling back to straight line.', e);
+      console.warn('OSRM routing fallback used.', e);
     }
 
     const distMeters = getDistanceInMeters(startLon, startLat, endLon, endLat);
@@ -192,6 +240,7 @@ export default function MapApp() {
     
     vectorSourceRef.current.clear();
     updateOriginMarker(centerCoords);
+    if (overlayRef.current) overlayRef.current.setPosition(undefined);
 
     const [lon, lat] = centerCoords;
     const airportRadiusMeters = airportRadiusMiles * 1609.34;
@@ -223,7 +272,7 @@ export default function MapApp() {
     }
 
     if (!data || !data.elements) {
-      setStatusLog('Search failed: Overpass server unresponsive.');
+      setStatusLog('Search failed: Overpass servers unresponsive.');
       setLoading(false);
       return;
     }
@@ -240,19 +289,22 @@ export default function MapApp() {
       const name = tags.name || tags['seamark:name'] || 'Unnamed Facility';
 
       if (tags.aeroway === 'aerodrome') {
-        const surface = tags.surface || tags['aeroway:surface'] || 'unknown';
-        const access = tags.access || 'public';
-        const lengthFeet = tags.length ? parseFloat(tags.length) * (tags.length.includes('m') ? 3.28084 : 1) : 0;
+        const surface = tags.surface || tags['aeroway:surface'] || 'Unknown';
+        const access = tags.access || 'Public';
+        const lengthFeet = tags.length ? Math.round(parseFloat(tags.length) * (tags.length.includes('m') ? 3.28084 : 1)) : 0;
+        const icao = tags.icao || tags['ref:icao'] || 'N/A';
 
-        airportsRaw.push({ id: elem.id, name, lat: eLat, lon: eLon, surface, access, lengthFeet });
+        airportsRaw.push({ id: elem.id, name, lat: eLat, lon: eLon, surface, access, lengthFeet, icao });
       } else if (tags.tourism === 'camp_site') {
-        campsitesRaw.push({ id: elem.id, name, lat: eLat, lon: eLon });
+        const fee = tags.fee || 'Unknown';
+        const capacity = tags.capacity || 'N/A';
+        campsitesRaw.push({ id: elem.id, name, lat: eLat, lon: eLon, fee, capacity });
       }
     });
 
     const filteredAirports = airportsRaw.filter((apt) => {
-      if (accessFilter === 'public' && apt.access === 'private') return false;
-      if (accessFilter === 'private' && apt.access !== 'private') return false;
+      if (accessFilter === 'public' && apt.access.toLowerCase() === 'private') return false;
+      if (accessFilter === 'private' && apt.access.toLowerCase() !== 'private') return false;
 
       const isPaved = ['asphalt', 'concrete', 'paved'].includes(apt.surface.toLowerCase());
       if (surfaceFilter === 'paved' && !isPaved) return false;
@@ -290,7 +342,12 @@ export default function MapApp() {
         const aptGeom = fromLonLat([apt.lon, apt.lat]);
 
         vectorSourceRef.current.addFeature(
-          new Feature({ geometry: new Point(aptGeom), name: apt.name, type: 'airport' })
+          new Feature({
+            geometry: new Point(aptGeom),
+            name: apt.name,
+            type: 'airport',
+            payload: apt
+          })
         );
         validAirports.push(apt);
 
@@ -309,7 +366,12 @@ export default function MapApp() {
 
           if (!campsitesDict[camp.id]) {
             vectorSourceRef.current.addFeature(
-              new Feature({ geometry: new Point(campGeom), name: camp.name, type: 'campsite' })
+              new Feature({
+                geometry: new Point(campGeom),
+                name: camp.name,
+                type: 'campsite',
+                payload: camp
+              })
             );
             campsitesDict[camp.id] = camp;
           }
@@ -327,84 +389,122 @@ export default function MapApp() {
 
     const matchedCampsites = Object.values(campsitesDict);
     setResults({ airports: validAirports, campsites: matchedCampsites });
-    setStatusLog(`Found ${validAirports.length} airports with road-accessible campsites within ${campRadiusMiles} miles.`);
+    setStatusLog(`Found ${validAirports.length} airports connected to campsites via road.`);
     setLoading(false);
   };
 
   return (
-    <div style={{ display: 'flex', height: '100vh', width: '100vw', fontFamily: 'Inter, system-ui, sans-serif', background: '#0f172a', color: '#f8fafc' }}>
-      <div style={{ width: '360px', padding: '1.5rem', background: '#1e293b', overflowY: 'auto', borderRight: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: '1.4rem', color: '#38bdf8', fontWeight: 700 }}>Air & Camp Explorer</h2>
-          <p style={{ margin: '4px 0 0 0', fontSize: '0.8rem', color: '#94a3b8' }}>
-            Click anywhere on the map to re-position your origin.
-          </p>
+    <div className="app-container">
+      <div className="sidebar">
+        <div className="sidebar-header">
+          <h2>RampCamp</h2>
+          <p>For General Aviation and Camping enthusiasts.</p>
         </div>
 
-        <div style={{ background: '#0f172a', padding: '0.75rem', borderRadius: '6px', border: '1px solid #334155', fontSize: '0.85rem' }}>
-          <span style={{ color: '#94a3b8' }}>Origin:</span> {centerCoords[1].toFixed(4)}, {centerCoords[0].toFixed(4)}
+        <div className="origin-card">
+          <span className="label">Origin:</span> {centerCoords[1].toFixed(4)}, {centerCoords[0].toFixed(4)}
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-          <div>
-            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>Flight Radius: {airportRadiusMiles} NM</label>
-            <input type="range" min="10" max="150" value={airportRadiusMiles} onChange={(e) => setAirportRadiusMiles(Number(e.target.value))} style={{ width: '100%' }} />
+        <div className="sidebar-header">
+          <p>Click anywhere on the map to set origin marker.</p>
+        </div>
+
+        <div className="filter-group">
+          <div className="control-item">
+            <label>Flight Radius: {airportRadiusMiles} NM</label>
+            <input type="range" min="10" max="500" value={airportRadiusMiles} onChange={(e) => setAirportRadiusMiles(Number(e.target.value))} />
           </div>
 
-          <div>
-            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>Road Radius to Camp: {campRadiusMiles} Miles</label>
-            <input type="range" min="1" max="50" value={campRadiusMiles} onChange={(e) => setCampRadiusMiles(Number(e.target.value))} style={{ width: '100%' }} />
+          <div className="control-item">
+            <label>Road Radius to Camp: {campRadiusMiles} Miles</label>
+            <input type="range" min="1" max="25" value={campRadiusMiles} onChange={(e) => setCampRadiusMiles(Number(e.target.value))} />
           </div>
 
-          <div>
-            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>Surface Type</label>
-            <select value={surfaceFilter} onChange={(e) => setSurfaceFilter(e.target.value)} style={{ width: '100%', padding: '0.5rem', background: '#0f172a', color: '#fff', border: '1px solid #334155', borderRadius: '4px', marginTop: '4px' }}>
+          <div className="control-item">
+            <label>Surface Type</label>
+            <select value={surfaceFilter} onChange={(e) => setSurfaceFilter(e.target.value)}>
               <option value="any">Any Surface</option>
               <option value="paved">Paved Only (Asphalt/Concrete)</option>
               <option value="unpaved">Unpaved Only (Turf/Grass/Dirt)</option>
             </select>
           </div>
 
-          <div>
-            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>Airport Access</label>
-            <select value={accessFilter} onChange={(e) => setAccessFilter(e.target.value)} style={{ width: '100%', padding: '0.5rem', background: '#0f172a', color: '#fff', border: '1px solid #334155', borderRadius: '4px', marginTop: '4px' }}>
+          <div className="control-item">
+            <label>Airport Access</label>
+            <select value={accessFilter} onChange={(e) => setAccessFilter(e.target.value)}>
               <option value="any">Public & Private</option>
               <option value="public">Public Access Only</option>
               <option value="private">Private Access Only</option>
             </select>
           </div>
 
-          <div>
-            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>Min Runway Length: {minRunwayLength} ft</label>
-            <input type="range" min="0" max="8000" step="500" value={minRunwayLength} onChange={(e) => setMinRunwayLength(Number(e.target.value))} style={{ width: '100%' }} />
+          <div className="control-item">
+            <label>Min Runway Length: {minRunwayLength} ft</label>
+            <input type="range" min="0" max="8000" step="500" value={minRunwayLength} onChange={(e) => setMinRunwayLength(Number(e.target.value))} />
           </div>
         </div>
 
-        <button onClick={handleSearch} disabled={loading} style={{ padding: '0.75rem', background: loading ? '#475569' : '#0284c7', color: '#fff', border: 'none', borderRadius: '6px', cursor: loading ? 'not-allowed' : 'pointer', fontWeight: 700, fontSize: '0.9rem' }}>
-          {loading ? 'Searching...' : 'Find Airports & Campsites'}
-        </button>
-
-        <div style={{ padding: '0.75rem', background: '#0f172a', borderRadius: '6px', border: '1px solid #334155', fontSize: '0.75rem', color: '#94a3b8' }}>
-          {statusLog}
+        <div className="action-buttons">
+          <button onClick={handleSearch} disabled={loading} className="btn-search">
+            {loading ? 'Searching...' : 'Find Matches'}
+          </button>
+          <button 
+            onClick={handleClearResults} 
+            disabled={loading || (results.airports.length === 0 && results.campsites.length === 0)} 
+            className="btn-clear"
+          >
+            Clear
+          </button>
         </div>
 
-        <div style={{ borderTop: '1px solid #334155', paddingTop: '1rem', display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.8rem' }}>
-          <div style={{ fontWeight: 600, color: '#cbd5e1', marginBottom: '4px' }}>Legend</div>
-          <div><span style={{ color: '#f43f5e' }}>●</span> Origin Location</div>
-          <div><span style={{ color: '#3b82f6' }}>●</span> Airport</div>
-          <div><span style={{ color: '#10b981' }}>●</span> Campsite</div>
-          <div><span style={{ color: '#0284c7' }}>┈</span> Direct Air Path (NM)</div>
-          <div><span style={{ color: '#f97316' }}>━</span> Road/Path Driving Distance (Miles)</div>
+        <div className="status-card">{statusLog}</div>
+
+        <div className="sidebar-section">
+          <div className="section-title">Legend</div>
+          <div className="legend-list">
+            <div><span className="dot-origin">●</span> Origin Location</div>
+            <div><span className="dot-airport">●</span> Airport</div>
+            <div><span className="dot-campsite">●</span> Campsite</div>
+            <div><span className="line-air">┈</span> Direct Air Path (NM)</div>
+            <div><span className="line-road">━</span> Driving Route (Miles)</div>
+          </div>
         </div>
 
-        <div style={{ borderTop: '1px solid #334155', paddingTop: '1rem' }}>
-          <div style={{ fontWeight: 600, color: '#cbd5e1', marginBottom: '4px', fontSize: '0.85rem' }}>Matches</div>
-          <div style={{ fontSize: '0.9rem', color: '#38bdf8' }}>Airports: <strong>{results.airports.length}</strong></div>
-          <div style={{ fontSize: '0.9rem', color: '#34d399' }}>Campsites: <strong>{results.campsites.length}</strong></div>
+        <div className="sidebar-section">
+          <div className="section-title">Matches</div>
+          <div className="result-stat-airport">Airports: <strong>{results.airports.length}</strong></div>
+          <div className="result-stat-campsite">Campsites: <strong>{results.campsites.length}</strong></div>
         </div>
       </div>
 
-      <div ref={mapElement} style={{ flex: 1, height: '100%' }} />
+      <div className="map-container" ref={mapElement}>
+        {/* Dynamic Tooltip Overlay Element */}
+        <div ref={tooltipElement} className="ol-tooltip">
+          {tooltipData && (
+            <>
+              <div className="ol-tooltip-header">{tooltipData.name}</div>
+              {tooltipData.type === 'airport' && tooltipData.details && (
+                <div>
+                  <div>ICAO: <strong>{tooltipData.details.icao}</strong></div>
+                  <div>Surface: <strong>{tooltipData.details.surface}</strong></div>
+                  <div>Access: <strong>{tooltipData.details.access}</strong></div>
+                  {tooltipData.details.lengthFeet > 0 && (
+                    <div>Est. Length: <strong>{tooltipData.details.lengthFeet} ft</strong></div>
+                  )}
+                  <span className="ol-tooltip-badge badge-airport">Airport</span>
+                </div>
+              )}
+              {tooltipData.type === 'campsite' && tooltipData.details && (
+                <div>
+                  <div>Fee Info: <strong>{tooltipData.details.fee}</strong></div>
+                  <div>Capacity: <strong>{tooltipData.details.capacity}</strong></div>
+                  <span className="ol-tooltip-badge badge-campsite">Campsite</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

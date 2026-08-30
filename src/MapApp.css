@@ -1,0 +1,229 @@
+/* Base Layout */
+.app-container {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  font-family: Inter, system-ui, sans-serif;
+  background-color: #0f172a;
+  color: #f8fafc;
+}
+
+/* Sidebar Panel */
+.sidebar {
+  width: 360px;
+  padding: 1.5rem;
+  background-color: #1e293b;
+  overflow-y: auto;
+  border-right: 1px solid #334155;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  box-sizing: border-box;
+}
+
+.sidebar-header h2 {
+  margin: 0;
+  font-size: 1.4rem;
+  color: #38bdf8;
+  font-weight: 700;
+}
+
+.sidebar-header p {
+  margin: 4px 0 0 0;
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+/* Origin Display Card */
+.origin-card {
+  background-color: #0f172a;
+  padding: 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  font-size: 0.85rem;
+}
+
+.origin-card .label {
+  color: #94a3b8;
+}
+
+/* Filter Controls */
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.control-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.control-item label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #cbd5e1;
+}
+
+.control-item select,
+.control-item input[type="range"] {
+  width: 100%;
+}
+
+.control-item select {
+  padding: 0.5rem;
+  background-color: #0f172a;
+  color: #fff;
+  border: 1px solid #334155;
+  border-radius: 4px;
+}
+
+/* Actions Group */
+.action-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-search {
+  flex: 2;
+  padding: 0.75rem;
+  background-color: #0284c7;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 0.9rem;
+  transition: background-color 0.2s ease;
+}
+
+.btn-search:hover:not(:disabled) {
+  background-color: #0369a1;
+}
+
+.btn-search:disabled {
+  background-color: #475569;
+  cursor: not-allowed;
+}
+
+.btn-clear {
+  flex: 1;
+  padding: 0.75rem;
+  background-color: #334155;
+  color: #f8fafc;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  transition: background-color 0.2s ease;
+}
+
+.btn-clear:hover:not(:disabled) {
+  background-color: #475569;
+}
+
+.btn-clear:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Status Log */
+.status-card {
+  padding: 0.75rem;
+  background-color: #0f172a;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+/* Sidebar Section Divider */
+.sidebar-section {
+  border-top: 1px solid #334155;
+  padding-top: 1rem;
+}
+
+.section-title {
+  font-weight: 600;
+  color: #cbd5e1;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+}
+
+/* Legend items */
+.legend-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.dot-origin { color: #f43f5e; }
+.dot-airport { color: #3b82f6; }
+.dot-campsite { color: #10b981; }
+.line-air { color: #0284c7; }
+.line-road { color: #f97316; }
+
+/* Results */
+.result-stat-airport {
+  font-size: 0.9rem;
+  color: #38bdf8;
+}
+
+.result-stat-campsite {
+  font-size: 0.9rem;
+  color: #34d399;
+}
+
+/* Map Wrapper */
+.map-container {
+  flex: 1;
+  height: 100%;
+  position: relative;
+}
+
+/* OpenLayers Custom Tooltip Overlay */
+.ol-tooltip {
+  position: absolute;
+  background-color: #0f172a;
+  color: #f8fafc;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid #38bdf8;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  font-size: 0.75rem;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  margin-top: -12px;
+  white-space: nowrap;
+  z-index: 100;
+}
+
+.ol-tooltip-header {
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #38bdf8;
+  margin-bottom: 2px;
+}
+
+.ol-tooltip-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-top: 4px;
+}
+
+.badge-airport {
+  background-color: #1e3a8a;
+  color: #60a5fa;
+}
+
+.badge-campsite {
+  background-color: #064e3b;
+  color: #34d399;
+}
