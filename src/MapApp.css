@@ -1,24 +1,50 @@
-/* Base Layout */
+/* Zero out root layout spacing to fit viewport cleanly */
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Base App Layout */
 .app-container {
   display: flex;
   height: 100vh;
   width: 100vw;
-  font-family: Inter, system-ui, sans-serif;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
   background-color: #0f172a;
   color: #f8fafc;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
 }
 
 /* Sidebar Panel */
 .sidebar {
   width: 360px;
-  padding: 1.5rem;
+  min-width: 360px;
+  height: 100vh;
+  padding: 1.25rem;
   background-color: #1e293b;
   overflow-y: auto;
   border-right: 1px solid #334155;
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 1rem;
   box-sizing: border-box;
+}
+
+/* Custom Scrollbar styling for sidebar */
+.sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+.sidebar::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+.sidebar::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
 }
 
 .sidebar-header h2 {
@@ -45,6 +71,13 @@
 
 .origin-card .label {
   color: #94a3b8;
+}
+
+.locked-badge {
+  color: #f43f5e;
+  font-size: 0.7rem;
+  font-weight: bold;
+  margin-left: 6px;
 }
 
 /* Filter Controls */
@@ -142,7 +175,7 @@
 /* Sidebar Section Divider */
 .sidebar-section {
   border-top: 1px solid #334155;
-  padding-top: 1rem;
+  padding-top: 0.85rem;
 }
 
 .section-title {
@@ -180,7 +213,7 @@
 /* Map Wrapper */
 .map-container {
   flex: 1;
-  height: 100%;
+  height: 100vh;
   position: relative;
 }
 
