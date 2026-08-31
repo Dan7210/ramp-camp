@@ -64,6 +64,24 @@ export default function MapApp() {
       return {};
     }
   });
+
+  // Helper to find the closest airport in faaAirports to the current center coordinates
+  const findNearestAirport = (coords) => {
+    const [lon, lat] = coords;
+    let closestApt = null;
+    let minDistanceNM = Infinity;
+
+    faaAirports.forEach((apt) => {
+      const distMeters = getDistanceInMeters(lon, lat, apt.lon, apt.lat);
+      const distNM = distMeters / 1852;
+      if (distNM < minDistanceNM) {
+        minDistanceNM = distNM;
+        closestApt = apt;
+      }
+    });
+
+    return closestApt;
+  };
   
   const [selectedSaveKey, setSelectedSaveKey] = useState('');
 
@@ -545,8 +563,14 @@ export default function MapApp() {
 
   const handleSaveState = () => {
     // Generate unique ID to prevent overwriting saved queries at similar origins
-    const uniqueId = `query_${Date.now()}`;
-    const displayLabel = `Origin (${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)}) - ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    const uniqueId = `query_${crypto.randomUUID()}`;
+    const nearestApt = findNearestAirport(centerCoords);
+    const aptIdentifier = nearestApt 
+      ? `${nearestApt.icao || nearestApt.id || 'N/A'}`
+      : `${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)}`;
+    
+    const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const displayLabel = `Near ${aptIdentifier} - ${timeString}`;
     
     const stateToSave = {
       id: uniqueId,
