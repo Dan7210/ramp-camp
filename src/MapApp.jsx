@@ -6,6 +6,7 @@ import TileLayer from 'ol/layer/Tile';
 import VectorLayer from 'ol/layer/Vector';
 import VectorSource from 'ol/source/Vector';
 import OSM from 'ol/source/OSM';
+import XYZ from 'ol/source/XYZ';
 import Feature from 'ol/Feature';
 import Point from 'ol/geom/Point';
 import LineString from 'ol/geom/LineString';
@@ -27,6 +28,11 @@ export default function MapApp() {
   const vectorSourceRef = useRef(new VectorSource());
   const abortControllerRef = useRef(null);
 
+  // Layer references for dynamic layer toggling
+  const osmLayerRef = useRef(null);
+  const satelliteLayerRef = useRef(null);
+  const aeronauticalLayerRef = useRef(null);
+
   const [centerCoords, setCenterCoords] = useState(KPDK_COORDS);
   const [airportRadiusMiles, setAirportRadiusMiles] = useState(50);
   const [campRadiusMiles, setCampRadiusMiles] = useState(15);
@@ -46,7 +52,10 @@ export default function MapApp() {
   const [results, setResults] = useState({ airports: [], campsites: [] });
   const [tooltipData, setTooltipData] = useState(null);
 
-  // Lazy initialize state from localStorage to prevent setState in useEffect warning
+  // Map Layer Selection state
+  const [activeBaseLayer, setActiveBaseLayer] = useState('osm'); // 'osm' | 'satellite' | 'faa'
+
+  // Lazy initialize state from localStorage
   const [savedStates, setSavedStates] = useState(() => {
     try {
       const saved = localStorage.getItem(MULTI_STORAGE_KEY);
@@ -56,7 +65,6 @@ export default function MapApp() {
     }
   });
   
-  // Track selected dropdown key cleanly
   const [selectedSaveKey, setSelectedSaveKey] = useState('');
 
   const updateOriginMarker = (coords) => {
@@ -74,6 +82,35 @@ export default function MapApp() {
   };
 
   useEffect(() => {
+    // Standard OSM Base Layer
+    const osmLayer = new TileLayer({
+      source: new OSM(),
+      visible: true
+    });
+    osmLayerRef.current = osmLayer;
+
+    // Esri World Imagery Satellite Layer
+    const satelliteLayer = new TileLayer({
+      source: new XYZ({
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        maxZoom: 19,
+        attributions: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+      }),
+      visible: false
+    });
+    satelliteLayerRef.current = satelliteLayer;
+
+    // Aeronautical Chart Overlay Layer
+    const aeronauticalLayer = new TileLayer({
+      source: new XYZ({
+        url: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}?cacheKey=80de4464e4be2193',
+        maxZoom: 14,
+        attributions: 'Federal Aviation Administration, Aeronautical Information Services'
+      }),
+      visible: false
+    });
+    aeronauticalLayerRef.current = aeronauticalLayer;
+
     const vectorLayer = new VectorLayer({
       source: vectorSourceRef.current,
       style: (feature) => {
@@ -126,7 +163,7 @@ export default function MapApp() {
 
         if (type === 'line-center-airport') {
           return new Style({
-            stroke: new Stroke({ color: '#0284c7', width: 2, lineDash: [6, 4] }),
+            stroke: new Stroke({ color: '#8f02c7', width: 4, lineDash: [6, 4] }),
             text: new Text({
               text: labelText,
               font: 'bold 11px sans-serif',
@@ -163,7 +200,7 @@ export default function MapApp() {
 
     const initialMap = new Map({
       target: mapElement.current,
-      layers: [new TileLayer({ source: new OSM() }), vectorLayer],
+      layers: [osmLayer, satelliteLayer, aeronauticalLayer, vectorLayer],
       overlays: [overlay],
       view: new View({
         center: fromLonLat(KPDK_COORDS),
@@ -213,6 +250,26 @@ export default function MapApp() {
     mapRef.current = initialMap;
     return () => initialMap.setTarget(null);
   }, []);
+
+  const handleBaseLayerChange = (layerType) => {
+    setActiveBaseLayer(layerType);
+    if (!osmLayerRef.current || !satelliteLayerRef.current || !aeronauticalLayerRef.current) return;
+
+    if (layerType === 'osm') {
+      osmLayerRef.current.setVisible(true);
+      satelliteLayerRef.current.setVisible(false);
+      aeronauticalLayerRef.current.setVisible(false);
+    } else if (layerType === 'satellite') {
+      osmLayerRef.current.setVisible(false);
+      satelliteLayerRef.current.setVisible(true);
+      aeronauticalLayerRef.current.setVisible(false);
+    } else if (layerType === 'faa') {
+      // OSM base layer with aeronautical chart layer overlayed
+      osmLayerRef.current.setVisible(true);
+      satelliteLayerRef.current.setVisible(false);
+      aeronauticalLayerRef.current.setVisible(true);
+    }
+  };
 
   const getDistanceInMeters = (lon1, lat1, lon2, lat2) => {
     const R = 6371000;
@@ -487,9 +544,13 @@ export default function MapApp() {
   };
 
   const handleSaveState = () => {
-    const originKey = `Origin (${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)})`;
+    // Generate unique ID to prevent overwriting saved queries at similar origins
+    const uniqueId = `query_${Date.now()}`;
+    const displayLabel = `Origin (${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)}) - ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    
     const stateToSave = {
-      label: `${originKey} - ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+      id: uniqueId,
+      label: displayLabel,
       centerCoords,
       airportRadiusMiles,
       campRadiusMiles,
@@ -502,11 +563,11 @@ export default function MapApp() {
       isLocked
     };
 
-    const updatedMap = { ...savedStates, [originKey]: stateToSave };
+    const updatedMap = { ...savedStates, [uniqueId]: stateToSave };
     setSavedStates(updatedMap);
-    setSelectedSaveKey(originKey);
+    setSelectedSaveKey(uniqueId);
     localStorage.setItem(MULTI_STORAGE_KEY, JSON.stringify(updatedMap));
-    setStatusLog(`Saved query for ${originKey}`);
+    setStatusLog(`Saved query: ${displayLabel}`);
   };
 
   const handleLoadState = () => {
@@ -784,14 +845,30 @@ export default function MapApp() {
       </div>
 
       <div className="map-container" ref={mapElement}>
-        <div className="map-legend">
-          <div className="legend-title">Legend</div>
-          <div className="legend-list">
-            <div><span className="dot-origin">●</span> Origin Location</div>
-            <div><span className="dot-airport">●</span> Airport</div>
-            <div><span className="dot-campsite">●</span> Campsite</div>
-            <div><span className="line-air">┈</span> Direct Air Path (NM)</div>
-            <div><span className="line-road">━</span> Driving Route (Miles)</div>
+        {/* Layer Selector & Legend Stack */}
+        <div className="map-overlay-controls">
+          <div className="map-layer-selector">
+            <div className="layer-selector-title">Map View</div>
+            <select 
+              value={activeBaseLayer} 
+              onChange={(e) => handleBaseLayerChange(e.target.value)}
+              className="select-layer"
+            >
+              <option value="osm">Standard (OSM)</option>
+              <option value="satellite">Satellite (Esri)</option>
+              <option value="faa">Aeronautical (FAA)</option>
+            </select>
+          </div>
+
+          <div className="map-legend">
+            <div className="legend-title">Legend</div>
+            <div className="legend-list">
+              <div><span className="dot-origin">●</span> Origin Location</div>
+              <div><span className="dot-airport">●</span> Airport</div>
+              <div><span className="dot-campsite">●</span> Campsite</div>
+              <div><span className="line-air">┈</span> Direct Air Path (NM)</div>
+              <div><span className="line-road">━</span> Driving Route (Miles)</div>
+            </div>
           </div>
         </div>
 
