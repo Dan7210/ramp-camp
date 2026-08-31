@@ -13,9 +13,9 @@ import LineString from 'ol/geom/LineString';
 import { Translate, Modify } from 'ol/interaction';
 import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
-
 import faaAirports from './airports.json';
 import gpsWaypoints from './waypoints.csv';
+import {magvar} from 'magvar';
 import './MapApp.css';
 import './MissionPlanner.css';
 
@@ -49,6 +49,34 @@ const extractCoords = (obj) => {
   const lon = Number.parseFloat(obj.lon ?? obj.longitude ?? obj.lng);
   const lat = Number.parseFloat(obj.lat ?? obj.latitude);
   return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null;
+};
+
+const getMagVar = async (lat, lon) => {
+  try {
+    const variation = magvar([lat], [lon]);
+    return variation || 0; // variation in degrees
+  } catch (err) {
+    console.warn('Mag var fetch failed, defaulting to 0', err);
+    return 0;
+  }
+};
+
+const getNextVfrAltitude = (targetAlt, course) => {
+  const isEastbound = course < 180;
+  
+  let alt = Math.ceil(targetAlt / 500) * 500;
+  if (alt < 3500) alt = 3500;
+  while (true) {
+    const endsIn500 = (alt % 1000) === 500;
+    const thousands = Math.floor(alt / 1000);
+    const isOdd = thousands % 2 !== 0;
+    if (endsIn500) {
+      if ((isEastbound && isOdd) || (!isEastbound && !isOdd)) {
+        return alt;
+      }
+    }
+    alt += 500;
+  }
 };
 
 const getMissionError = (missionData) => {
@@ -98,26 +126,38 @@ const calculateCourse = (start, end) => {
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 };
 
-const roundTo500 = (altitude) => Math.ceil(altitude / 500) * 500;
+const getAltitudeSuggestion = (start, end, analysis, analysisStatus) => {
+  // Only suggest if analysis has been completed or failed
+  if (analysisStatus === 'Not analyzed') return null;
 
-const getAltitudeSuggestion = (start, end, analysis) => {
-  const course = Math.round(calculateCourse(start, end));
-  const vfrAltitude = course < 180 ? 5500 : 4500;
-  const terrainMslFeet = analysis?.terrainMslFeet ?? null;
-  const suggestedMslFeet = roundTo500(Math.max(terrainMslFeet ?? 0, analysis?.airspaceMslFeet ?? vfrAltitude));
+  const trueCourse = Math.round(calculateCourse(start, end));
+  const magVar = analysis?.magVar ?? 0;
+  const magCourse = (trueCourse - magVar + 360) % 360;
+  
+  const terrainMslFeet = analysis?.terrainMslFeet ?? 0;
+  const airspaceMslFeet = analysis?.airspaceMslFeet ?? 0;
+  
+  // Calculate the absolute minimum required (Terrain vs Airspace)
+  const minRequired = Math.max(terrainMslFeet, airspaceMslFeet);
+  
+  // Apply the strict VFR hemispheric + 500 rule
+  const suggestedMslFeet = getNextVfrAltitude(minRequired, trueCourse);
+
   return {
-    course,
+    course: trueCourse,
+    magCourse,
+    magVar,
     suggestedMslFeet,
-    terrainMslFeet,
+    terrainMslFeet: analysis?.terrainMslFeet ?? null,
     airspaceMslFeet: analysis?.airspaceMslFeet ?? null,
     rationale: analysis ? [
-      `Approximate course ${course}° true; verify magnetic variation before using the VFR hemispheric rule.`,
-      `USGS EPQS corridor high point ${analysis.highestTerrainFeet.toLocaleString()} ft MSL; +500 ft terrain minimum ${terrainMslFeet.toLocaleString()} ft MSL.`,
+      `Course: ${trueCourse}°T (${Math.round(magCourse)}°M); Var: ${magVar.toFixed(1)}°`,
+      `Min required: ${minRequired.toLocaleString()} ft MSL.`,
       ...analysis.airspaceNotes
     ] : [
-      `Approximate course ${course}° true; verify magnetic variation before using the VFR hemispheric rule.`,
-      'Run “Analyze route safety” to sample USGS terrain and query FAA Class B/C/D airspace.',
-      'FAA sectional, NOTAM, and TFR review remains required before flight.'
+      `Course: ${trueCourse}°T; Verify magnetic variation.`,
+      'Run “Analyze route safety” to sample terrain and airspace.',
+      'FAA sectional/NOTAM review required.'
     ]
   };
 };
@@ -176,31 +216,33 @@ const getIntersectingAirspace = async (start, end) => {
 const describeAirspace = (airspaces, terrainMslFeet, defaultVfrMslFeet) => {
   const notes = [];
   let airspaceMslFeet = defaultVfrMslFeet;
+  
   airspaces.forEach((airspace) => {
     const lower = Number(airspace.LOWER_VAL);
     const upper = Number(airspace.UPPER_VAL);
     const label = `${airspace.CLASS || 'Class'} ${airspace.NAME || airspace.IDENT || 'airspace'}`;
+    
     if (!Number.isFinite(lower) || !Number.isFinite(upper)) {
-      notes.push(`${label}: FAA vertical limits require chart review (${airspace.LOWER_DESC || 'lower not parsed'} to ${airspace.UPPER_DESC || 'upper not parsed'}).`);
+      notes.push(`${label}: Check chart for vertical limits.`);
       return;
     }
     if (terrainMslFeet >= lower && terrainMslFeet <= upper) {
-      notes.push(`${label}: terrain minimum ${terrainMslFeet.toLocaleString()} ft intersects FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; airspace penetration may be unavoidable.`);
+      notes.push(`${label}: Terrain intersects ${lower}-${upper} ft limits.`);
       return;
     }
     if (defaultVfrMslFeet >= lower && defaultVfrMslFeet <= upper) {
       if (terrainMslFeet < lower - 500) {
         airspaceMslFeet = Math.min(airspaceMslFeet, lower - 500);
-        notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; underflight is available above the terrain minimum.`);
+        notes.push(`${label}: Underflight available below ${lower} ft.`);
       } else {
         airspaceMslFeet = Math.max(airspaceMslFeet, upper + 500);
-        notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; recommendation raised to overfly.`);
+        notes.push(`${label}: Suggest overflight above ${upper} ft.`);
       }
       return;
     }
-    notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; current suggestion remains outside this shelf.`);
+    notes.push(`${label}: Route remains outside ${lower}-${upper} ft shelf.`);
   });
-  return { airspaceMslFeet, airspaceNotes: notes.length ? notes : ['No FAA Class B/C/D polygons intersected the route centerline.'] };
+  return { airspaceMslFeet, airspaceNotes: notes.length ? notes : ['No Class B/C/D intersections found.'] };
 };
 
 export default function MissionPlanner({ missionData, onBack, onProceed }) {
@@ -553,10 +595,20 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
         const highestTerrainFeet = Math.ceil(Math.max(...elevations));
         const terrainMslFeet = highestTerrainFeet + 500;
         const airspaces = await getIntersectingAirspace(leg.start, leg.end);
-        const vfrAltitude = calculateCourse(leg.start, leg.end) < 180 ? 4500 : 5500;
+        
+        // Calculate VFR base for the airspace logic
+        const course = calculateCourse(leg.start, leg.end);
+        const vfrAltitude = getNextVfrAltitude(3000, course);
+
+        // Fetch magnetic variation for the leg midpoint
+        const midLat = (leg.start.lat + leg.end.lat) / 2;
+        const midLon = (leg.start.lon + leg.end.lon) / 2;
+        const magVar = await getMagVar(midLat, midLon);
+
         return [leg.id, {
           highestTerrainFeet,
           terrainMslFeet,
+          magVar,
           ...describeAirspace(airspaces, terrainMslFeet, vfrAltitude),
           airspaceCount: airspaces.length
         }];
@@ -564,7 +616,7 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
       setRouteAnalysis(Object.fromEntries(analyses));
       setAnalysisStatus('Route safety analysis complete');
     } catch (error) {
-      setAnalysisError(error instanceof Error ? error.message : 'Route safety analysis could not be completed.');
+      setAnalysisError(error instanceof Error ? error.message : 'Analysis failed.');
       setAnalysisStatus('Analysis unavailable');
     }
   };

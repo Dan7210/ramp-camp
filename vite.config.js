@@ -11,8 +11,6 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/overpass/, '')
       },
-      // AviationWeather deliberately does not allow browser CORS. These routes keep
-      // development requests same-origin; deploy matching reverse-proxy routes in production.
       '/aviationweather': {
         target: 'https://aviationweather.gov',
         changeOrigin: true,

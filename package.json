@@ -12,6 +12,7 @@
   "dependencies": {
     "geolib": "^3.3.14",
     "lucide-react": "^1.37.0",
+    "magvar": "^2.2.0",
     "ol": "^10.10.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

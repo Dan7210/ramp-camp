@@ -375,6 +375,7 @@ export default function MapApp() {
     }
 
     return () => initialMap.setTarget(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentView]);
 
   // ---------------------------------------------------------------------------
