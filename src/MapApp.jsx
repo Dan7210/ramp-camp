@@ -14,6 +14,7 @@ import Overlay from 'ol/Overlay';
 import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
 
+import MissionPlanner from './MissionPlanner';
 import faaAirports from './airports.json';
 import './MapApp.css';
 
@@ -32,6 +33,10 @@ export default function MapApp() {
   const osmLayerRef = useRef(null);
   const satelliteLayerRef = useRef(null);
   const aeronauticalLayerRef = useRef(null);
+
+  // Navigation / View State
+  const [currentView, setCurrentView] = useState('map'); // 'map' | 'planner'
+  const [selectedMission, setSelectedMission] = useState(null);
 
   const [centerCoords, setCenterCoords] = useState(KPDK_COORDS);
   const [airportRadiusMiles, setAirportRadiusMiles] = useState(50);
@@ -53,7 +58,7 @@ export default function MapApp() {
   const [tooltipData, setTooltipData] = useState(null);
 
   // Map Layer Selection state
-  const [activeBaseLayer, setActiveBaseLayer] = useState('osm'); // 'osm' | 'satellite' | 'faa'
+  const [activeBaseLayer, setActiveBaseLayer] = useState('osm');
 
   // Lazy initialize state from localStorage
   const [savedStates, setSavedStates] = useState(() => {
@@ -65,7 +70,105 @@ export default function MapApp() {
     }
   });
 
-  // Helper to find the closest airport in faaAirports to the current center coordinates
+  const [selectedSaveKey, setSelectedSaveKey] = useState('');
+
+  // ---------------------------------------------------------------------------
+  // HELPER & RENDER FUNCTIONS (Declared before useEffect to avoid TDZ errors)
+  // ---------------------------------------------------------------------------
+
+  const updateOriginMarker = (coords) => {
+    const features = vectorSourceRef.current.getFeatures();
+    features.forEach((f) => {
+      if (f.get('type') === 'center') vectorSourceRef.current.removeFeature(f);
+    });
+
+    vectorSourceRef.current.addFeature(
+      new Feature({
+        geometry: new Point(fromLonLat(coords)),
+        type: 'center'
+      })
+    );
+  };
+
+  const renderFilteredResults = (dataset, airRadiusLimit, campRadiusLimit, surfaceMode, accessMode, minRunway) => {
+    if (!dataset) return;
+
+    vectorSourceRef.current.clear();
+    const [lon, lat] = dataset.origin;
+    updateOriginMarker([lon, lat]);
+    if (overlayRef.current) overlayRef.current.setPosition(undefined);
+
+    const validAirports = [];
+    const campsitesDict = {};
+
+    dataset.airports.forEach((apt) => {
+      if (apt.distFromCenterNM > airRadiusLimit) return;
+
+      if (accessMode === 'public' && !apt.isPublic) return;
+      if (accessMode === 'private' && apt.isPublic) return;
+
+      const surfaceLower = apt.surface ? apt.surface.toLowerCase() : '';
+      const isPaved = surfaceLower.includes('asph') || surfaceLower.includes('conc') || surfaceLower.includes('paved');
+      if (surfaceMode === 'paved' && !isPaved) return;
+      if (surfaceMode === 'unpaved' && isPaved) return;
+
+      if (minRunway > 0 && apt.lengthFeet > 0 && apt.lengthFeet < minRunway) return;
+
+      const validConnections = apt.connections.filter(
+        ({ route }) => parseFloat(route.distanceMiles) <= campRadiusLimit
+      );
+
+      if (validConnections.length > 0) {
+        const aptGeom = fromLonLat([apt.lon, apt.lat]);
+
+        vectorSourceRef.current.addFeature(
+          new Feature({
+            geometry: new Point(aptGeom),
+            name: apt.name,
+            type: 'airport',
+            payload: apt
+          })
+        );
+        validAirports.push(apt);
+
+        vectorSourceRef.current.addFeature(
+          new Feature({
+            geometry: new LineString([fromLonLat([lon, lat]), aptGeom]),
+            type: 'line-center-airport',
+            label: `${apt.distFromCenterNM.toFixed(1)} NM`
+          })
+        );
+
+        validConnections.forEach(({ camp, route }) => {
+          const campGeom = fromLonLat([camp.lon, camp.lat]);
+
+          if (!campsitesDict[camp.id]) {
+            vectorSourceRef.current.addFeature(
+              new Feature({
+                geometry: new Point(campGeom),
+                name: camp.name,
+                type: 'campsite',
+                payload: camp
+              })
+            );
+            campsitesDict[camp.id] = camp;
+          }
+
+          vectorSourceRef.current.addFeature(
+            new Feature({
+              geometry: new LineString(route.coordinates),
+              type: 'route-airport-camp',
+              label: `${route.distanceMiles} mi (Road)`
+            })
+          );
+        });
+      }
+    });
+
+    const matchedCampsites = Object.values(campsitesDict);
+    setResults({ airports: validAirports, campsites: matchedCampsites });
+  };
+
   const findNearestAirport = (coords) => {
     const [lon, lat] = coords;
     let closestApt = null;
@@ -82,32 +185,31 @@ export default function MapApp() {
 
     return closestApt;
   };
-  
-  const [selectedSaveKey, setSelectedSaveKey] = useState('');
 
-  const updateOriginMarker = (coords) => {
-    const features = vectorSourceRef.current.getFeatures();
-    features.forEach((f) => {
-      if (f.get('type') === 'center') vectorSourceRef.current.removeFeature(f);
-    });
-
-    vectorSourceRef.current.addFeature(
-      new Feature({
-        geometry: new Point(fromLonLat(coords)),
-        type: 'center'
-      })
-    );
+  const getDistanceInMeters = (lon1, lat1, lon2, lat2) => {
+    const R = 6371000;
+    const rad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * rad;
+    const dLon = (lon2 - lon1) * rad;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
+  // ---------------------------------------------------------------------------
+  // MAP EFFECT
+  // ---------------------------------------------------------------------------
+
   useEffect(() => {
-    // Standard OSM Base Layer
+    if (currentView !== 'map') return;
+
     const osmLayer = new TileLayer({
       source: new OSM(),
       visible: true
     });
     osmLayerRef.current = osmLayer;
 
-    // Esri World Imagery Satellite Layer
     const satelliteLayer = new TileLayer({
       source: new XYZ({
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -118,7 +220,6 @@ export default function MapApp() {
     });
     satelliteLayerRef.current = satelliteLayer;
 
-    // Aeronautical Chart Overlay Layer
     const aeronauticalLayer = new TileLayer({
       source: new XYZ({
         url: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}?cacheKey=80de4464e4be2193',
@@ -221,12 +322,12 @@ export default function MapApp() {
       layers: [osmLayer, satelliteLayer, aeronauticalLayer, vectorLayer],
       overlays: [overlay],
       view: new View({
-        center: fromLonLat(KPDK_COORDS),
+        center: fromLonLat(centerCoords),
         zoom: 9
       })
     });
 
-    updateOriginMarker(KPDK_COORDS);
+    updateOriginMarker(centerCoords);
 
     initialMap.on('singleclick', (evt) => {
       setIsLocked((locked) => {
@@ -261,13 +362,22 @@ export default function MapApp() {
         mapElement.current.style.cursor = 'pointer';
       } else {
         overlay.setPosition(undefined);
-        mapElement.current.style.cursor = '';
+        if (mapElement.current) mapElement.current.style.cursor = '';
       }
     });
 
     mapRef.current = initialMap;
+
+    if (cachedData) {
+      renderFilteredResults(cachedData, airportRadiusMiles, campRadiusMiles, surfaceFilter, accessFilter, minRunwayLength);
+    }
+
     return () => initialMap.setTarget(null);
-  }, []);
+  }, [currentView]);
+
+  // ---------------------------------------------------------------------------
+  // HANDLERS
+  // ---------------------------------------------------------------------------
 
   const handleBaseLayerChange = (layerType) => {
     setActiveBaseLayer(layerType);
@@ -282,22 +392,10 @@ export default function MapApp() {
       satelliteLayerRef.current.setVisible(true);
       aeronauticalLayerRef.current.setVisible(false);
     } else if (layerType === 'faa') {
-      // OSM base layer with aeronautical chart layer overlayed
       osmLayerRef.current.setVisible(true);
       satelliteLayerRef.current.setVisible(false);
       aeronauticalLayerRef.current.setVisible(true);
     }
-  };
-
-  const getDistanceInMeters = (lon1, lat1, lon2, lat2) => {
-    const R = 6371000;
-    const rad = Math.PI / 180;
-    const dLat = (lat2 - lat1) * rad;
-    const dLon = (lon2 - lon1) * rad;
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
   const getRoadRoute = async (startLon, startLat, endLon, endLat, signal) => {
@@ -379,7 +477,7 @@ export default function MapApp() {
       if (accessFilter === 'public' && !apt.isPublic) return false;
       if (accessFilter === 'private' && apt.isPublic) return false;
 
-      const surfaceLower = apt.surface.toLowerCase();
+      const surfaceLower = apt.surface ? apt.surface.toLowerCase() : '';
       const isPaved = surfaceLower.includes('asph') || surfaceLower.includes('conc') || surfaceLower.includes('paved');
       if (surfaceFilter === 'paved' && !isPaved) return false;
       if (surfaceFilter === 'unpaved' && isPaved) return false;
@@ -462,85 +560,6 @@ export default function MapApp() {
     abortControllerRef.current = null;
   };
 
-  const renderFilteredResults = (dataset, airRadiusLimit, campRadiusLimit, surfaceMode, accessMode, minRunway) => {
-    if (!dataset) return;
-
-    vectorSourceRef.current.clear();
-    const [lon, lat] = dataset.origin;
-    updateOriginMarker([lon, lat]);
-    if (overlayRef.current) overlayRef.current.setPosition(undefined);
-
-    const validAirports = [];
-    const campsitesDict = {};
-
-    dataset.airports.forEach((apt) => {
-      if (apt.distFromCenterNM > airRadiusLimit) return;
-
-      if (accessMode === 'public' && !apt.isPublic) return;
-      if (accessMode === 'private' && apt.isPublic) return;
-
-      const surfaceLower = apt.surface.toLowerCase();
-      const isPaved = surfaceLower.includes('asph') || surfaceLower.includes('conc') || surfaceLower.includes('paved');
-      if (surfaceMode === 'paved' && !isPaved) return;
-      if (surfaceMode === 'unpaved' && isPaved) return;
-
-      if (minRunway > 0 && apt.lengthFeet > 0 && apt.lengthFeet < minRunway) return;
-
-      const validConnections = apt.connections.filter(
-        ({ route }) => parseFloat(route.distanceMiles) <= campRadiusLimit
-      );
-
-      if (validConnections.length > 0) {
-        const aptGeom = fromLonLat([apt.lon, apt.lat]);
-
-        vectorSourceRef.current.addFeature(
-          new Feature({
-            geometry: new Point(aptGeom),
-            name: apt.name,
-            type: 'airport',
-            payload: apt
-          })
-        );
-        validAirports.push(apt);
-
-        vectorSourceRef.current.addFeature(
-          new Feature({
-            geometry: new LineString([fromLonLat([lon, lat]), aptGeom]),
-            type: 'line-center-airport',
-            label: `${apt.distFromCenterNM.toFixed(1)} NM`
-          })
-        );
-
-        validConnections.forEach(({ camp, route }) => {
-          const campGeom = fromLonLat([camp.lon, camp.lat]);
-
-          if (!campsitesDict[camp.id]) {
-            vectorSourceRef.current.addFeature(
-              new Feature({
-                geometry: new Point(campGeom),
-                name: camp.name,
-                type: 'campsite',
-                payload: camp
-              })
-            );
-            campsitesDict[camp.id] = camp;
-          }
-
-          vectorSourceRef.current.addFeature(
-            new Feature({
-              geometry: new LineString(route.coordinates),
-              type: 'route-airport-camp',
-              label: `${route.distanceMiles} mi (Road)`
-            })
-          );
-        });
-      }
-    });
-
-    const matchedCampsites = Object.values(campsitesDict);
-    setResults({ airports: validAirports, campsites: matchedCampsites });
-  };
-
   const handleClearResults = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -562,7 +581,6 @@ export default function MapApp() {
   };
 
   const handleSaveState = () => {
-    // Generate unique ID to prevent overwriting saved queries at similar origins
     const uniqueId = `query_${crypto.randomUUID()}`;
     const nearestApt = findNearestAirport(centerCoords);
     const aptIdentifier = nearestApt 
@@ -690,6 +708,36 @@ export default function MapApp() {
     URL.revokeObjectURL(url);
   };
 
+  // Fixed payload format to provide both array & object formats for origin coordinates
+  const handleSelectMission = (airport, camp, route) => {
+    // Standardize airport coordinates
+    const normalizedAirport = {
+      ...airport,
+      lon: airport.lon ?? airport.longitude ?? airport.lng,
+      lat: airport.lat ?? airport.latitude
+    };
+
+    // Standardize campsite coordinates
+    const normalizedCamp = {
+      ...camp,
+      lon: camp.lon ?? camp.longitude ?? camp.lng,
+      lat: camp.lat ?? camp.latitude
+    };
+
+    setSelectedMission({
+      origin: {
+        lon: centerCoords[0],
+        lat: centerCoords[1]
+      },
+      originCoords: centerCoords,
+      airport: normalizedAirport,
+      campsite: normalizedCamp,
+      route
+    });
+    
+    setCurrentView('planner');
+  };
+
   const handleAirportRadiusChange = (val) => {
     setAirportRadiusMiles(val);
     if (cachedData) {
@@ -726,6 +774,16 @@ export default function MapApp() {
   };
 
   const savedKeysList = Object.keys(savedStates);
+
+  // Render Mission Planner view if triggered
+  if (currentView === 'planner' && selectedMission) {
+    return (
+      <MissionPlanner 
+        missionData={selectedMission} 
+        onBack={() => setCurrentView('map')} 
+      />
+    );
+  }
 
   return (
     <div className="app-container">
@@ -856,7 +914,21 @@ export default function MapApp() {
                       .filter(({ route }) => parseFloat(route.distanceMiles) <= campRadiusMiles)
                       .map(({ camp, route }) => (
                         <div key={camp.id} className="list-item-campsite">
-                          <span>⛺ {camp.name} ({route.distanceMiles} mi)</span>
+                          <span 
+                            style={{ cursor: 'pointer', flex: 1 }}
+                            onClick={() => handleSelectMission(apt, camp, route)}
+                            title="Click to plan mission"
+                          >
+                            ⛺ {camp.name} ({route.distanceMiles} mi)
+                          </span>
+                          <button 
+                            onClick={() => handleSelectMission(apt, camp, route)}
+                            className="btn-plan-sm"
+                            title="Plan Mission"
+                            style={{ marginRight: '4px' }}
+                          >
+                            Plan
+                          </button>
                           <button onClick={() => handleRemoveCampsite(camp.id)} className="btn-remove-sm" title="Remove Campsite">✕</button>
                         </div>
                       ))}
@@ -869,7 +941,6 @@ export default function MapApp() {
       </div>
 
       <div className="map-container" ref={mapElement}>
-        {/* Layer Selector & Legend Stack */}
         <div className="map-overlay-controls">
           <div className="map-layer-selector">
             <div className="layer-selector-title">Map View</div>
@@ -890,35 +961,30 @@ export default function MapApp() {
               <div><span className="dot-origin">●</span> Origin Location</div>
               <div><span className="dot-airport">●</span> Airport</div>
               <div><span className="dot-campsite">●</span> Campsite</div>
-              <div><span className="line-air">┈</span> Direct Air Path (NM)</div>
-              <div><span className="line-road">━</span> Driving Route (Miles)</div>
+              <div><span className="line-flight">--</span> Flight Leg</div>
+              <div><span className="line-road">―</span> Road Leg</div>
             </div>
           </div>
         </div>
 
         <div ref={tooltipElement} className="ol-tooltip">
           {tooltipData && (
-            <>
-              <div className="ol-tooltip-header">{tooltipData.name}</div>
-              {tooltipData.type === 'airport' && tooltipData.details && (
+            <div>
+              <strong>{tooltipData.name}</strong>
+              {tooltipData.type === 'airport' && (
                 <div>
-                  <div>ICAO/ID: <strong>{tooltipData.details.icao}</strong></div>
-                  <div>Surface: <strong>{tooltipData.details.surface}</strong></div>
-                  <div>Access: <strong>{tooltipData.details.access}</strong></div>
-                  {tooltipData.details.lengthFeet > 0 && (
-                    <div>Primary Runway: <strong>{tooltipData.details.lengthFeet} ft</strong></div>
-                  )}
-                  <span className="ol-tooltip-badge badge-airport">Airport</span>
+                  <small>ICAO: {tooltipData.details.icao || 'N/A'}</small><br />
+                  <small>Surface: {tooltipData.details.surface}</small><br />
+                  <small>Runway: {tooltipData.details.lengthFeet} ft</small>
                 </div>
               )}
-              {tooltipData.type === 'campsite' && tooltipData.details && (
+              {tooltipData.type === 'campsite' && (
                 <div>
-                  <div>Fee Info: <strong>{tooltipData.details.fee}</strong></div>
-                  <div>Capacity: <strong>{tooltipData.details.capacity}</strong></div>
-                  <span className="ol-tooltip-badge badge-campsite">Campsite</span>
+                  <small>Fee: {tooltipData.details.fee}</small><br />
+                  <small>Capacity: {tooltipData.details.capacity}</small>
                 </div>
               )}
-            </>
+            </div>
           )}
         </div>
       </div>

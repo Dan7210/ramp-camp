@@ -3,6 +3,7 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react()],
+  assetsInclude: ['**/*.csv'],
   server: {
     proxy: {
       '/overpass': {
