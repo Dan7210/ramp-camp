@@ -15,6 +15,7 @@ import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
 
 import MissionPlanner from './MissionPlanner';
+import NwkraftMissionBriefing from './NwkraftMissionBriefing';
 import faaAirports from './airports.json';
 import './MapApp.css';
 
@@ -35,8 +36,9 @@ export default function MapApp() {
   const aeronauticalLayerRef = useRef(null);
 
   // Navigation / View State
-  const [currentView, setCurrentView] = useState('map'); // 'map' | 'planner'
+  const [currentView, setCurrentView] = useState('map'); // 'map' | 'planner' | 'briefing'
   const [selectedMission, setSelectedMission] = useState(null);
+  const [flightPlan, setFlightPlan] = useState(null);
 
   const [centerCoords, setCenterCoords] = useState(KPDK_COORDS);
   const [airportRadiusMiles, setAirportRadiusMiles] = useState(50);
@@ -781,8 +783,16 @@ export default function MapApp() {
       <MissionPlanner 
         missionData={selectedMission} 
         onBack={() => setCurrentView('map')} 
+        onProceed={(plan) => {
+          setFlightPlan(plan);
+          setCurrentView('briefing');
+        }}
       />
     );
+  }
+
+  if (currentView === 'briefing' && flightPlan) {
+    return <NwkraftMissionBriefing missionPlan={flightPlan} onBack={() => setCurrentView('planner')} />;
   }
 
   return (

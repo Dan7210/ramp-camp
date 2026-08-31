@@ -1,0 +1,18 @@
+.nwkraft-page { display: flex; min-height: 100vh; background: #f8fafc; color: #0f172a; }
+.nwkraft-sidebar { width: 330px; padding: 20px; background: #fff; border-right: 1px solid #cbd5e1; overflow-y: auto; box-sizing: border-box; }
+.nwkraft-sidebar h2, .nwkraft-content h1, .briefing-section h3 { margin-top: 0; }
+.nwkraft-sidebar > p { color: #475569; font-size: .85rem; }
+.nwkraft-content { flex: 1; padding: 28px; overflow: auto; }
+.briefing-section { margin: 18px 0; padding: 16px; background: #fff; border: 1px solid #dbe3ed; border-radius: 8px; }
+.briefing-label { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: .8rem; font-weight: 700; }
+.briefing-label input { padding: 7px; border: 1px solid #94a3b8; border-radius: 4px; font: inherit; }
+.performance-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 10px; }
+.nwkraft-sidebar a { display: block; margin-top: 12px; font-size: .85rem; color: #0369a1; }
+.notam-check { display: block; margin-top: 12px; font-size: .8rem; line-height: 1.35; }
+.fuel-totals { display: flex; gap: 20px; margin-bottom: 12px; font-weight: 700; color: #075985; }
+.nwkraft-content table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.nwkraft-content th, .nwkraft-content td { padding: 9px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+.nwkraft-content th { background: #f1f5f9; }
+.nwkraft-content pre { padding: 10px; white-space: pre-wrap; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; font-size: .78rem; }
+.briefing-error { color: #b91c1c; font-weight: 700; }
+@media (max-width: 800px) { .nwkraft-page { flex-direction: column; } .nwkraft-sidebar { width: 100%; border-right: 0; border-bottom: 1px solid #cbd5e1; } }

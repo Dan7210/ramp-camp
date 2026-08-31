@@ -18,7 +18,107 @@ import faaAirports from './airports.json';
 import gpsWaypoints from './waypoints.csv';
 import './MapApp.css';
 
-export default function MissionPlanner({ missionData, onBack }) {
+const parseDMSCoords = (dmsStr) => {
+  if (!dmsStr) return null;
+  const parts = dmsStr.trim().split(/\s+/);
+  if (parts.length < 2) return null;
+
+  const parsePart = (str) => {
+    const match = str.match(/^(\d+)-(\d+)-([\d.]+)([NSEW])$/);
+    if (!match) return null;
+    const degrees = Number.parseFloat(match[1]);
+    const minutes = Number.parseFloat(match[2]);
+    const seconds = Number.parseFloat(match[3]);
+    const value = degrees + minutes / 60 + seconds / 3600;
+    return match[4] === 'S' || match[4] === 'W' ? -value : value;
+  };
+
+  const lat = parsePart(parts[0]);
+  const lon = parsePart(parts[1]);
+  return lat !== null && lon !== null ? { lat, lon } : null;
+};
+
+const extractCoords = (obj) => {
+  if (!obj) return null;
+  if (Array.isArray(obj) && obj.length >= 2) {
+    const lon = Number.parseFloat(obj[0]);
+    const lat = Number.parseFloat(obj[1]);
+    return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null;
+  }
+  const lon = Number.parseFloat(obj.lon ?? obj.longitude ?? obj.lng);
+  const lat = Number.parseFloat(obj.lat ?? obj.latitude);
+  return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null;
+};
+
+const getMissionError = (missionData) => {
+  if (!missionData) return 'No mission data provided.';
+  if (!extractCoords(missionData.origin || missionData.originCoords)) {
+    return 'Missing or invalid Origin coordinates.';
+  }
+  if (!extractCoords(missionData.airport)) {
+    return 'Missing or invalid Destination Airport coordinates.';
+  }
+  return null;
+};
+
+const createInitialWaypoints = (missionData) => {
+  const origin = extractCoords(missionData?.origin || missionData?.originCoords);
+  const airport = extractCoords(missionData?.airport);
+  if (!origin || !airport) return [];
+
+  return [
+    { id: 'origin_wp', name: 'Origin Marker', type: 'origin', ...origin },
+    {
+      id: `apt_${missionData.airport.icao || missionData.airport.id || 'dest'}`,
+      name: missionData.airport.name || 'Destination Airport',
+      type: 'airport',
+      icao: missionData.airport.icao || 'N/A',
+      surface: missionData.airport.surface || 'Unknown',
+      lengthFeet: missionData.airport.lengthFeet || null,
+      ...airport
+    }
+  ];
+};
+
+const calculateNM = (p1, p2) => {
+  const rad = Math.PI / 180;
+  const dLat = (p2.lat - p1.lat) * rad;
+  const dLon = (p2.lon - p1.lon) * rad;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(p1.lat * rad) * Math.cos(p2.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return (6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))) / 1852;
+};
+
+const calculateCourse = (start, end) => {
+  const rad = Math.PI / 180;
+  const y = Math.sin((end.lon - start.lon) * rad) * Math.cos(end.lat * rad);
+  const x = Math.cos(start.lat * rad) * Math.sin(end.lat * rad)
+    - Math.sin(start.lat * rad) * Math.cos(end.lat * rad) * Math.cos((end.lon - start.lon) * rad);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+};
+
+const roundTo500 = (altitude) => Math.ceil(altitude / 500) * 500;
+
+const getAltitudeSuggestion = (start, end) => {
+  const course = Math.round(calculateCourse(start, end));
+  // Magnetic variation and the FAA obstacle/airspace data feed are deliberately not guessed.
+  // Until a route-analysis service is configured, a conservative VFR hemispheric altitude is
+  // offered as a starting point and the FAA sectional layer remains available for pilot review.
+  const vfrAltitude = course < 180 ? 4500 : 5500;
+  return {
+    course,
+    suggestedMslFeet: roundTo500(vfrAltitude),
+    terrainMslFeet: null,
+    airspaceMslFeet: null,
+    rationale: [
+      `Approximate course ${course}° true; verify magnetic variation before using the VFR hemispheric rule.`,
+      'Terrain/obstacle minimum: FAA digital obstacle and sectional data must be reviewed; no local terrain dataset is bundled.',
+      'Airspace: review the FAA sectional layer for Class B/C/D, special-use, TFR, and charted altitude constraints.'
+    ]
+  };
+};
+
+export default function MissionPlanner({ missionData, onBack, onProceed }) {
   const mapElement = useRef(null);
   const mapRef = useRef(null);
   const vectorSourceRef = useRef(new VectorSource());
@@ -28,81 +128,19 @@ export default function MissionPlanner({ missionData, onBack }) {
   const satelliteLayerRef = useRef(null);
   const aeronauticalLayerRef = useRef(null);
 
-  const [plannerError, setPlannerError] = useState(null);
   const [activeBaseLayer, setActiveBaseLayer] = useState('osm');
 
   // Loaded navigation fixes dataset
   const [navFixes, setNavFixes] = useState([]);
 
   // Waypoints sequence
-  const [waypoints, setWaypoints] = useState([]);
+  const [waypoints, setWaypoints] = useState(() => createInitialWaypoints(missionData));
+  const [selectedAltitudes, setSelectedAltitudes] = useState({});
 
   // UI state for search insertion
   const [activeAddIndex, setActiveAddIndex] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
-
-  // Helper to parse DMS strings like "42-07-12.6800N 071-08-30.3400W" into { lat, lon }
-  const parseDMSCoords = (dmsStr) => {
-    if (!dmsStr) return null;
-    const parts = dmsStr.trim().split(/\s+/);
-    if (parts.length < 2) return null;
-
-    const parsePart = (str) => {
-      const match = str.match(/^(\d+)-(\d+)-([\d.]+)([NSEW])$/);
-      if (!match) return null;
-      const deg = parseFloat(match[1]);
-      const min = parseFloat(match[2]);
-      const sec = parseFloat(match[3]);
-      const dir = match[4];
-      let val = deg + min / 60 + sec / 3600;
-      if (dir === 'S' || dir === 'W') val = -val;
-      return val;
-    };
-
-    const lat = parsePart(parts[0]);
-    const lon = parsePart(parts[1]);
-
-    return (lat !== null && lon !== null) ? { lat, lon } : null;
-  };
-
-  // Safely extract coordinates from varying object structures
-  const extractCoords = (obj) => {
-    if (!obj) return null;
-    if (Array.isArray(obj) && obj.length >= 2) {
-      const lon = parseFloat(obj[0]);
-      const lat = parseFloat(obj[1]);
-      return (!isNaN(lon) && !isNaN(lat)) ? { lon, lat } : null;
-    }
-    const lon = parseFloat(obj.lon ?? obj.longitude ?? obj.lng);
-    const lat = parseFloat(obj.lat ?? obj.latitude);
-    return (!isNaN(lon) && !isNaN(lat)) ? { lon, lat } : null;
-  };
-
-  // Great Circle distance calculation in NM
-  const calculateNM = (p1, p2) => {
-    const rad = Math.PI / 180;
-    const dLat = (p2.lat - p1.lat) * rad;
-    const dLon = (p2.lon - p1.lon) * rad;
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(p1.lat * rad) * Math.cos(p2.lat * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return (6371000 * c) / 1852;
-  };
-
-  const calculateLegs = () => {
-    const legs = [];
-    let totalNM = 0;
-    for (let i = 0; i < waypoints.length - 1; i++) {
-      const start = waypoints[i];
-      const end = waypoints[i + 1];
-      const dist = calculateNM(start, end);
-      totalNM += dist;
-      legs.push({ start, end, distNM: dist });
-    }
-    return { legs, totalNM };
-  };
 
   // Load and parse GPS navigation fixes CSV file
   useEffect(() => {
@@ -149,48 +187,6 @@ export default function MissionPlanner({ missionData, onBack }) {
     loadNavFixes();
     return () => { isMounted = false; };
   }, []);
-
-  // Initialize payload waypoints
-  useEffect(() => {
-    if (!missionData) {
-      setPlannerError('No mission data provided.');
-      return;
-    }
-
-    const origin = extractCoords(missionData.origin || missionData.originCoords);
-    const airport = extractCoords(missionData.airport);
-
-    if (!origin) {
-      setPlannerError('Missing or invalid Origin coordinates.');
-      return;
-    }
-    if (!airport) {
-      setPlannerError('Missing or invalid Destination Airport coordinates.');
-      return;
-    }
-
-    const initialList = [
-      {
-        id: 'origin_wp',
-        name: 'Origin Marker',
-        type: 'origin',
-        lon: origin.lon,
-        lat: origin.lat
-      },
-      {
-        id: `apt_${missionData.airport.icao || missionData.airport.id || 'dest'}`,
-        name: missionData.airport.name || 'Destination Airport',
-        type: 'airport',
-        icao: missionData.airport.icao || 'N/A',
-        surface: missionData.airport.surface || 'Unknown',
-        lengthFeet: missionData.airport.lengthFeet || null,
-        lon: airport.lon,
-        lat: airport.lat
-      }
-    ];
-
-    setWaypoints(initialList);
-  }, [missionData]);
 
   // OpenLayers Map initialization with layer support
   useEffect(() => {
@@ -388,26 +384,11 @@ export default function MissionPlanner({ missionData, onBack }) {
     mapRef.current = map;
 
     return () => map.setTarget(null);
-  }, [waypoints.length]);
+  }, [activeBaseLayer, waypoints]);
 
   // Handle layer switching
   const handleBaseLayerChange = (layerType) => {
     setActiveBaseLayer(layerType);
-    if (!osmLayerRef.current || !satelliteLayerRef.current || !aeronauticalLayerRef.current) return;
-
-    if (layerType === 'osm') {
-      osmLayerRef.current.setVisible(true);
-      satelliteLayerRef.current.setVisible(false);
-      aeronauticalLayerRef.current.setVisible(false);
-    } else if (layerType === 'satellite') {
-      osmLayerRef.current.setVisible(false);
-      satelliteLayerRef.current.setVisible(true);
-      aeronauticalLayerRef.current.setVisible(false);
-    } else if (layerType === 'faa') {
-      osmLayerRef.current.setVisible(true);
-      satelliteLayerRef.current.setVisible(false);
-      aeronauticalLayerRef.current.setVisible(true);
-    }
   };
 
   const handleRemoveWaypoint = (idToRemove) => {
@@ -467,7 +448,21 @@ export default function MissionPlanner({ missionData, onBack }) {
     setSearchResults([]);
   };
 
-  const { legs, totalNM } = calculateLegs();
+  const plannerError = getMissionError(missionData);
+  const legs = waypoints.slice(0, -1).map((start, index) => {
+    const end = waypoints[index + 1];
+    const suggestion = getAltitudeSuggestion(start, end);
+    return {
+      id: `${start.id}-${end.id}`,
+      start,
+      end,
+      distNM: calculateNM(start, end),
+      ...suggestion,
+      selectedMslFeet: selectedAltitudes[`${start.id}-${end.id}`] ?? ''
+    };
+  });
+  const totalNM = legs.reduce((total, leg) => total + leg.distNM, 0);
+  const allLegsHaveAltitude = legs.length > 0 && legs.every((leg) => Number(leg.selectedMslFeet) > 0);
 
   if (plannerError) {
     return (
@@ -564,6 +559,56 @@ export default function MissionPlanner({ missionData, onBack }) {
                         ↓ Leg {idx + 1}: {legToNext ? legToNext.distNM.toFixed(1) : 0} NM
                       </div>
 
+                      {legToNext && (
+                        <div
+                          style={{
+                            width: '100%',
+                            background: '#f8fafc',
+                            border: '1px solid #dbeafe',
+                            borderRadius: '6px',
+                            padding: '8px',
+                            boxSizing: 'border-box',
+                            fontSize: '11px',
+                            color: '#334155'
+                          }}
+                        >
+                          <strong>Suggested minimum cruise: {legToNext.suggestedMslFeet.toLocaleString()} MSL</strong>
+                          <ul style={{ margin: '5px 0 8px', paddingLeft: '17px', lineHeight: 1.35 }}>
+                            {legToNext.rationale.map((reason) => <li key={reason}>{reason}</li>)}
+                          </ul>
+                          <label style={{ display: 'block', fontWeight: 700, marginBottom: '4px' }}>
+                            Selected cruise MSL altitude
+                          </label>
+                          <div style={{ display: 'flex', gap: '5px' }}>
+                            <input
+                              type="number"
+                              min="500"
+                              step="500"
+                              inputMode="numeric"
+                              aria-label={`Selected MSL altitude for leg ${idx + 1}`}
+                              placeholder={`${legToNext.suggestedMslFeet}`}
+                              value={legToNext.selectedMslFeet}
+                              onChange={(event) => setSelectedAltitudes((previous) => ({
+                                ...previous,
+                                [legToNext.id]: event.target.value
+                              }))}
+                              style={{ flex: 1, minWidth: 0, padding: '5px', border: '1px solid #94a3b8', borderRadius: '4px' }}
+                            />
+                            <button
+                              type="button"
+                              className="btn-plan-sm"
+                              onClick={() => setSelectedAltitudes((previous) => ({
+                                ...previous,
+                                [legToNext.id]: String(legToNext.suggestedMslFeet)
+                              }))}
+                              style={{ padding: '4px 7px', fontSize: '10px' }}
+                            >
+                              Use suggestion
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
                       {activeAddIndex === idx ? (
                         <div
                           style={{
@@ -655,8 +700,19 @@ export default function MissionPlanner({ missionData, onBack }) {
         </div>
 
         <div className="status-card" style={{ marginTop: 'auto' }}>
-          Tip: Drag flight route lines or waypoints on the map to modify legs.
+          Tip: Drag flight route lines or waypoints on the map to modify legs. Altitude suggestions are planning aids, not a substitute for a current FAA briefing.
         </div>
+
+        <button
+          type="button"
+          className="btn-plan"
+          disabled={!allLegsHaveAltitude}
+          onClick={() => onProceed?.({ missionData, waypoints, legs })}
+          style={{ width: '100%', marginTop: '12px', opacity: allLegsHaveAltitude ? 1 : 0.55 }}
+          title={allLegsHaveAltitude ? 'Continue to the NWKRAFT mission briefing' : 'Select an MSL altitude for every leg first'}
+        >
+          Continue to NWKRAFT Mission Briefing
+        </button>
       </div>
 
       {/* Map Container */}
@@ -679,9 +735,9 @@ export default function MissionPlanner({ missionData, onBack }) {
           <div className="map-legend">
             <div className="legend-title">Flight Plan Legend</div>
             <div className="legend-list">
-              <div><span className="dot-origin">●</span> Origin / Endpoints</div>
-              <div><span className="dot-airport">●</span> Destination / Airfield</div>
-              <div><span style={{ color: '#8f02c7' }}>●</span> Waypoint / GPS Fix</div>
+              <div><span className="dot-origin">●</span> Origin</div>
+              <div><span className="dot-airport">●</span> Destination</div>
+              <div><span style={{ color: '#8f02c7' }}>●</span> Enroute Waypoint</div>
               <div><span className="line-flight">--</span> Flight Leg Path</div>
             </div>
           </div>
