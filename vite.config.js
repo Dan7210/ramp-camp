@@ -10,6 +10,26 @@ export default defineConfig({
         target: 'https://overpass-api.de/api/interpreter',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/overpass/, '')
+      },
+      // AviationWeather deliberately does not allow browser CORS. These routes keep
+      // development requests same-origin; deploy matching reverse-proxy routes in production.
+      '/aviationweather': {
+        target: 'https://aviationweather.gov',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/aviationweather/, '/api/data')
+      },
+      '/usgs-epqs': {
+        target: 'https://epqs.nationalmap.gov',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/usgs-epqs/, '/v1/json')
+      },
+      '/faa-airspace': {
+        target: 'https://services6.arcgis.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(
+          /^\/faa-airspace/,
+          '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Class_Airspace/FeatureServer/0/query'
+        )
       }
     }
   }

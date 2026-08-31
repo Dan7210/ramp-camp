@@ -1,198 +1,25 @@
-.planner-view {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  background-color: #f8fafc;
-  color: #0f172a;
-  box-sizing: border-box;
-}
+.mission-planner .sidebar { gap: 0.85rem; }
+.mission-planner .btn-back, .mission-planner .btn-plan, .mission-planner .btn-plan-sm { border: 1px solid #475569; border-radius: 6px; color: #f8fafc; cursor: pointer; font-weight: 700; }
+.mission-planner .btn-back { padding: 0.7rem; background: #334155; }
+.mission-planner .btn-back:hover { background: #475569; }
+.mission-planner .btn-plan { padding: 0.8rem; background: #0284c7; border-color: #0ea5e9; }
+.mission-planner .btn-plan:hover:not(:disabled), .mission-planner .btn-plan-sm:hover { background: #0369a1; }
+.mission-planner .btn-plan:disabled { cursor: not-allowed; }
 
-.planner-header {
-  display: flex;
-  align-items: center;
-  gap: 24px;
-  padding: 16px 24px;
-  background-color: #ffffff;
-  border-bottom: 1px solid #e2e8f0;
-}
+.route-analysis-card { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.75rem; background: #0f172a; border: 1px solid #334155; border-radius: 6px; }
+.route-analysis-card > div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.route-analysis-card strong { color: #e2e8f0; font-size: 0.8rem; }
+.route-analysis-card span, .analysis-error { color: #94a3b8; font-size: 0.72rem; }
+.analysis-error { color: #fda4af; }
+.route-analysis-card .btn-search { width: 100%; padding: 0.55rem; font-size: 0.78rem; }
 
-.btn-clear {
-  flex: 1;
-  padding: 0.75rem;
-  background-color: #334155;
-  color: #f8fafc;
-  border: 1px solid #475569;
-  border-radius: 6px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.85rem;
-  transition: background-color 0.2s ease;
-}
+.mission-planner .interactive-list { gap: 0.65rem; }
+.altitude-card { width: 100%; box-sizing: border-box; padding: 0.7rem; color: #cbd5e1; background: #172554; border: 1px solid #1d4ed8; border-radius: 6px; font-size: 0.72rem; }
+.altitude-card strong { color: #7dd3fc; }
+.altitude-card ul { margin: 0.45rem 0 0.7rem; padding-left: 1rem; line-height: 1.4; }
+.altitude-label { display: block; margin-bottom: 0.3rem; color: #e2e8f0; font-weight: 700; }
+.altitude-input-row { display: flex; gap: 0.35rem; }
+.altitude-input { flex: 1; min-width: 0; padding: 0.35rem; color: #f8fafc; background: #0f172a; border: 1px solid #475569; border-radius: 4px; }
+.mission-planner .btn-plan-sm { padding: 0.35rem 0.55rem; background: #0284c7; }
 
-.btn-back {
-  padding: 0.75rem;
-  background-color: #334155;
-  color: #f8fafc;
-  border: 1px solid #475569;
-  border-radius: 6px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.85rem;
-  transition: background-color 0.2s ease;
-}
-
-.btn-back:hover {
-  background-color: #e2e8f0;
-}
-
-.brand-title h1 {
-  margin: 0;
-  font-size: 1.5rem;
-  color: #1e3a8a;
-}
-
-.brand-title .subtitle {
-  margin: 2px 0 0 0;
-  font-size: 0.875rem;
-  color: #64748b;
-}
-
-.planner-content {
-  display: flex;
-  flex: 1;
-  gap: 24px;
-  padding: 24px;
-  overflow: hidden;
-}
-
-/* Left Controls Panel */
-.planner-panel {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  background: #ffffff;
-  padding: 24px;
-  border-radius: 8px;
-  border: 1px solid #e2e8f0;
-  overflow-y: auto;
-}
-
-.route-endpoints {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background-color: #f8fafc;
-  padding: 12px;
-  border-radius: 6px;
-}
-
-.endpoint-badge {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-}
-
-.endpoint-badge .label {
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  color: #64748b;
-  font-weight: 700;
-}
-
-.route-arrow {
-  font-size: 1.25rem;
-  color: #94a3b8;
-}
-
-.route-input-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.route-input-group label {
-  font-weight: 600;
-  font-size: 0.875rem;
-}
-
-.route-input-group textarea {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  resize: vertical;
-  font-family: inherit;
-  box-sizing: border-box;
-}
-
-.btn-update-route {
-  align-self: flex-start;
-  padding: 10px 18px;
-  background-color: #2563eb;
-  color: #ffffff;
-  border: none;
-  border-radius: 6px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.btn-update-route:hover {
-  background-color: #1d4ed8;
-}
-
-.waypoint-summary ul {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-
-.waypoint-summary li {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 0;
-  border-bottom: 1px solid #f1f5f9;
-}
-
-.wp-num {
-  background: #e2e8f0;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.75rem;
-  font-weight: 700;
-}
-
-.wp-warning {
-  color: #d97706;
-  font-size: 0.75rem;
-}
-
-/* Embedded Right Map Container */
-.planner-map-container {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: #ffffff;
-  padding: 16px;
-  border-radius: 8px;
-  border: 1px solid #e2e8f0;
-}
-
-.planner-map-container h3 {
-  margin: 0 0 12px 0;
-  font-size: 1rem;
-}
-
-.embedded-map {
-  width: 100%;
-  height: 100%;
-  min-height: 350px;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 1px solid #cbd5e1;
-}
+@media (max-width: 720px) { .mission-planner .sidebar { width: 320px; min-width: 320px; } }

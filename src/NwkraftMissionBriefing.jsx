@@ -80,8 +80,8 @@ export default function NwkraftMissionBriefing({ missionPlan, onBack }) {
     try {
       const ids = encodeURIComponent(airportIds.join(','));
       const [metarResponse, tafResponse] = await Promise.all([
-        fetch(`https://aviationweather.gov/api/data/metar?ids=${ids}&format=json&taf=false`),
-        fetch(`https://aviationweather.gov/api/data/taf?ids=${ids}&format=json`)
+        fetch(`/aviationweather/metar?ids=${ids}&format=json&taf=false`),
+        fetch(`/aviationweather/taf?ids=${ids}&format=json`)
       ]);
       if (!metarResponse.ok || !tafResponse.ok) {
         throw new Error('Aviation Weather returned an unavailable response.');
@@ -98,8 +98,8 @@ export default function NwkraftMissionBriefing({ missionPlan, onBack }) {
   return (
     <div className="nwkraft-page">
       <aside className="nwkraft-sidebar">
-        <h2>NWKRAFT Mission Briefing</h2>
-        <p>Mission planning aid — verify all operational data before flight.</p>
+        <h2>RampCamp</h2>
+        <p>For General Aviation and Camping enthusiasts.</p>
         <button type="button" className="btn-back" onClick={onBack}>← Return to altitude planning</button>
 
         <label className="briefing-label">

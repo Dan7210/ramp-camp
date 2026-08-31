@@ -17,6 +17,7 @@ import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
 import faaAirports from './airports.json';
 import gpsWaypoints from './waypoints.csv';
 import './MapApp.css';
+import './MissionPlanner.css';
 
 const parseDMSCoords = (dmsStr) => {
   if (!dmsStr) return null;
@@ -99,23 +100,107 @@ const calculateCourse = (start, end) => {
 
 const roundTo500 = (altitude) => Math.ceil(altitude / 500) * 500;
 
-const getAltitudeSuggestion = (start, end) => {
+const getAltitudeSuggestion = (start, end, analysis) => {
   const course = Math.round(calculateCourse(start, end));
-  // Magnetic variation and the FAA obstacle/airspace data feed are deliberately not guessed.
-  // Until a route-analysis service is configured, a conservative VFR hemispheric altitude is
-  // offered as a starting point and the FAA sectional layer remains available for pilot review.
-  const vfrAltitude = course < 180 ? 4500 : 5500;
+  const vfrAltitude = course < 180 ? 5500 : 4500;
+  const terrainMslFeet = analysis?.terrainMslFeet ?? null;
+  const suggestedMslFeet = roundTo500(Math.max(terrainMslFeet ?? 0, analysis?.airspaceMslFeet ?? vfrAltitude));
   return {
     course,
-    suggestedMslFeet: roundTo500(vfrAltitude),
-    terrainMslFeet: null,
-    airspaceMslFeet: null,
-    rationale: [
+    suggestedMslFeet,
+    terrainMslFeet,
+    airspaceMslFeet: analysis?.airspaceMslFeet ?? null,
+    rationale: analysis ? [
       `Approximate course ${course}° true; verify magnetic variation before using the VFR hemispheric rule.`,
-      'Terrain/obstacle minimum: FAA digital obstacle and sectional data must be reviewed; no local terrain dataset is bundled.',
-      'Airspace: review the FAA sectional layer for Class B/C/D, special-use, TFR, and charted altitude constraints.'
+      `USGS EPQS corridor high point ${analysis.highestTerrainFeet.toLocaleString()} ft MSL; +500 ft terrain minimum ${terrainMslFeet.toLocaleString()} ft MSL.`,
+      ...analysis.airspaceNotes
+    ] : [
+      `Approximate course ${course}° true; verify magnetic variation before using the VFR hemispheric rule.`,
+      'Run “Analyze route safety” to sample USGS terrain and query FAA Class B/C/D airspace.',
+      'FAA sectional, NOTAM, and TFR review remains required before flight.'
     ]
   };
+};
+
+const getCorridorSamples = (start, end, distanceNm) => {
+  const count = Math.min(20, Math.max(4, Math.ceil(distanceNm / 5) + 1));
+  const courseRadians = calculateCourse(start, end) * Math.PI / 180;
+  return Array.from({ length: count }, (_, index) => {
+    const ratio = index / (count - 1);
+    const lat = start.lat + (end.lat - start.lat) * ratio;
+    const lon = start.lon + (end.lon - start.lon) * ratio;
+    return [-0.5, 0, 0.5].map((offsetNm) => {
+      const rightBearing = courseRadians + Math.PI / 2;
+      const northNm = Math.cos(rightBearing) * offsetNm;
+      const eastNm = Math.sin(rightBearing) * offsetNm;
+      return {
+        lat: lat + northNm / 60,
+        lon: lon + eastNm / (60 * Math.max(0.1, Math.cos(lat * Math.PI / 180)))
+      };
+    });
+  }).flat();
+};
+
+const getElevation = async ({ lat, lon }) => {
+  const parameters = new URLSearchParams({ x: String(lon), y: String(lat), units: 'Feet', wkid: '4326', includeDate: 'false' });
+  const response = await fetch(`/usgs-epqs?${parameters}`);
+  if (!response.ok) throw new Error(`USGS EPQS returned ${response.status}.`);
+  const data = await response.json();
+  const elevation = Number(data.value ?? data.USGS_Elevation_Point_Query_Service?.Elevation_Query?.Elevation);
+  if (!Number.isFinite(elevation)) throw new Error('USGS EPQS returned no usable elevation.');
+  return elevation;
+};
+
+const getIntersectingAirspace = async (start, end) => {
+  const geometry = JSON.stringify({
+    paths: [[[start.lon, start.lat], [end.lon, end.lat]]],
+    spatialReference: { wkid: 4326 }
+  });
+  const parameters = new URLSearchParams({
+    f: 'json',
+    where: "CLASS IN ('B','C','D')",
+    geometry,
+    geometryType: 'esriGeometryPolyline',
+    inSR: '4326',
+    spatialRel: 'esriSpatialRelIntersects',
+    outFields: 'IDENT,NAME,CLASS,LOWER_DESC,LOWER_VAL,LOWER_UOM,UPPER_DESC,UPPER_VAL,UPPER_UOM',
+    returnGeometry: 'false'
+  });
+  const response = await fetch(`/faa-airspace?${parameters}`);
+  if (!response.ok) throw new Error(`FAA airspace service returned ${response.status}.`);
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message || 'FAA airspace query failed.');
+  return (data.features || []).map((feature) => feature.attributes);
+};
+
+const describeAirspace = (airspaces, terrainMslFeet, defaultVfrMslFeet) => {
+  const notes = [];
+  let airspaceMslFeet = defaultVfrMslFeet;
+  airspaces.forEach((airspace) => {
+    const lower = Number(airspace.LOWER_VAL);
+    const upper = Number(airspace.UPPER_VAL);
+    const label = `${airspace.CLASS || 'Class'} ${airspace.NAME || airspace.IDENT || 'airspace'}`;
+    if (!Number.isFinite(lower) || !Number.isFinite(upper)) {
+      notes.push(`${label}: FAA vertical limits require chart review (${airspace.LOWER_DESC || 'lower not parsed'} to ${airspace.UPPER_DESC || 'upper not parsed'}).`);
+      return;
+    }
+    if (terrainMslFeet >= lower && terrainMslFeet <= upper) {
+      notes.push(`${label}: terrain minimum ${terrainMslFeet.toLocaleString()} ft intersects FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; airspace penetration may be unavoidable.`);
+      return;
+    }
+    if (defaultVfrMslFeet >= lower && defaultVfrMslFeet <= upper) {
+      if (terrainMslFeet < lower - 500) {
+        airspaceMslFeet = Math.min(airspaceMslFeet, lower - 500);
+        notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; underflight is available above the terrain minimum.`);
+      } else {
+        airspaceMslFeet = Math.max(airspaceMslFeet, upper + 500);
+        notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; recommendation raised to overfly.`);
+      }
+      return;
+    }
+    notes.push(`${label}: FAA limits ${lower.toLocaleString()}–${upper.toLocaleString()} ft; current suggestion remains outside this shelf.`);
+  });
+  return { airspaceMslFeet, airspaceNotes: notes.length ? notes : ['No FAA Class B/C/D polygons intersected the route centerline.'] };
 };
 
 export default function MissionPlanner({ missionData, onBack, onProceed }) {
@@ -136,6 +221,9 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
   // Waypoints sequence
   const [waypoints, setWaypoints] = useState(() => createInitialWaypoints(missionData));
   const [selectedAltitudes, setSelectedAltitudes] = useState({});
+  const [routeAnalysis, setRouteAnalysis] = useState({});
+  const [analysisStatus, setAnalysisStatus] = useState('Not analyzed');
+  const [analysisError, setAnalysisError] = useState('');
 
   // UI state for search insertion
   const [activeAddIndex, setActiveAddIndex] = useState(null);
@@ -448,12 +536,46 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
     setSearchResults([]);
   };
 
+  const analyzeRouteSafety = async () => {
+    const legsToAnalyze = waypoints.slice(0, -1).map((start, index) => ({
+      id: `${start.id}-${waypoints[index + 1].id}`,
+      start,
+      end: waypoints[index + 1],
+      distanceNm: calculateNM(start, waypoints[index + 1])
+    }));
+    if (legsToAnalyze.length === 0) return;
+
+    setAnalysisStatus('Analyzing terrain and FAA airspace…');
+    setAnalysisError('');
+    try {
+      const analyses = await Promise.all(legsToAnalyze.map(async (leg) => {
+        const elevations = await Promise.all(getCorridorSamples(leg.start, leg.end, leg.distanceNm).map(getElevation));
+        const highestTerrainFeet = Math.ceil(Math.max(...elevations));
+        const terrainMslFeet = highestTerrainFeet + 500;
+        const airspaces = await getIntersectingAirspace(leg.start, leg.end);
+        const vfrAltitude = calculateCourse(leg.start, leg.end) < 180 ? 4500 : 5500;
+        return [leg.id, {
+          highestTerrainFeet,
+          terrainMslFeet,
+          ...describeAirspace(airspaces, terrainMslFeet, vfrAltitude),
+          airspaceCount: airspaces.length
+        }];
+      }));
+      setRouteAnalysis(Object.fromEntries(analyses));
+      setAnalysisStatus('Route safety analysis complete');
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : 'Route safety analysis could not be completed.');
+      setAnalysisStatus('Analysis unavailable');
+    }
+  };
+
   const plannerError = getMissionError(missionData);
   const legs = waypoints.slice(0, -1).map((start, index) => {
     const end = waypoints[index + 1];
-    const suggestion = getAltitudeSuggestion(start, end);
+    const id = `${start.id}-${end.id}`;
+    const suggestion = getAltitudeSuggestion(start, end, routeAnalysis[id]);
     return {
-      id: `${start.id}-${end.id}`,
+      id,
       start,
       end,
       distNM: calculateNM(start, end),
@@ -480,7 +602,7 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
   }
 
   return (
-    <div className="app-container">
+    <div className="app-container mission-planner">
       {/* Sidebar - Matching MapApp header and structure */}
       <div className="sidebar">
         <div className="sidebar-header">
@@ -494,6 +616,17 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
 
         <div className="origin-card">
           <span className="label">Total Flight Distance:</span> {totalNM.toFixed(1)} NM
+        </div>
+
+        <div className="route-analysis-card">
+          <div>
+            <strong>Route Safety Analysis</strong>
+            <span>{analysisStatus}</span>
+          </div>
+          <button type="button" className="btn-search" onClick={analyzeRouteSafety} disabled={analysisStatus.includes('Analyzing')}>
+            {analysisStatus.includes('Analyzing') ? 'Analyzing…' : 'Analyze terrain & airspace'}
+          </button>
+          {analysisError && <small className="analysis-error">{analysisError}</small>}
         </div>
 
         <div className="sidebar-section matches-section">
@@ -560,26 +693,15 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
                       </div>
 
                       {legToNext && (
-                        <div
-                          style={{
-                            width: '100%',
-                            background: '#f8fafc',
-                            border: '1px solid #dbeafe',
-                            borderRadius: '6px',
-                            padding: '8px',
-                            boxSizing: 'border-box',
-                            fontSize: '11px',
-                            color: '#334155'
-                          }}
-                        >
+                        <div className="altitude-card">
                           <strong>Suggested minimum cruise: {legToNext.suggestedMslFeet.toLocaleString()} MSL</strong>
-                          <ul style={{ margin: '5px 0 8px', paddingLeft: '17px', lineHeight: 1.35 }}>
+                          <ul>
                             {legToNext.rationale.map((reason) => <li key={reason}>{reason}</li>)}
                           </ul>
-                          <label style={{ display: 'block', fontWeight: 700, marginBottom: '4px' }}>
+                          <label className="altitude-label">
                             Selected cruise MSL altitude
                           </label>
-                          <div style={{ display: 'flex', gap: '5px' }}>
+                          <div className="altitude-input-row">
                             <input
                               type="number"
                               min="500"
@@ -592,7 +714,7 @@ export default function MissionPlanner({ missionData, onBack, onProceed }) {
                                 ...previous,
                                 [legToNext.id]: event.target.value
                               }))}
-                              style={{ flex: 1, minWidth: 0, padding: '5px', border: '1px solid #94a3b8', borderRadius: '4px' }}
+                              className="altitude-input"
                             />
                             <button
                               type="button"
