@@ -15,7 +15,7 @@ import { fromLonLat, toLonLat } from 'ol/proj';
 import { Style, Circle, Fill, Stroke, Text } from 'ol/style';
 
 import MissionPlanner from './MissionPlanner';
-import NwkraftMissionBriefing from './NwkraftMissionBriefing';
+import MissionBriefing from './MissionBriefing';
 import faaAirports from './airports.json';
 import './MapApp.css';
 
@@ -793,7 +793,7 @@ export default function MapApp() {
   }
 
   if (currentView === 'briefing' && flightPlan) {
-    return <NwkraftMissionBriefing missionPlan={flightPlan} onBack={() => setCurrentView('planner')} />;
+    return <MissionBriefing missionPlan={flightPlan} onBack={() => setCurrentView('planner')} />;
   }
 
   return (

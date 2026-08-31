@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import faaAirports from './airports.json';
-import './NwkraftMissionBriefing.css';
+import './MissionBriefing.css';
 
 const DEFAULT_PERFORMANCE = {
   climbKt: 90,
@@ -27,7 +27,7 @@ const findAirport = (waypoint) => {
   );
 };
 
-export default function NwkraftMissionBriefing({ missionPlan, onBack }) {
+export default function MissionBriefing({ missionPlan, onBack }) {
   const [etd, setEtd] = useState(() => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16));
   const [performance, setPerformance] = useState(DEFAULT_PERFORMANCE);
   const [weather, setWeather] = useState({ status: 'Not requested', metars: [], tafs: [] });
