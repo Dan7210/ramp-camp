@@ -17,6 +17,7 @@ import faaAirports from './airports.json';
 import './MapApp.css';
 
 const KPDK_COORDS = [-84.3020, 33.8756];
+const MULTI_STORAGE_KEY = 'rampcamp_saved_queries';
 
 export default function MapApp() {
   const mapElement = useRef(null);
@@ -44,6 +45,19 @@ export default function MapApp() {
   const [cachedData, setCachedData] = useState(null);
   const [results, setResults] = useState({ airports: [], campsites: [] });
   const [tooltipData, setTooltipData] = useState(null);
+
+  // Lazy initialize state from localStorage to prevent setState in useEffect warning
+  const [savedStates, setSavedStates] = useState(() => {
+    try {
+      const saved = localStorage.getItem(MULTI_STORAGE_KEY);
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+  
+  // Track selected dropdown key cleanly
+  const [selectedSaveKey, setSelectedSaveKey] = useState('');
 
   const updateOriginMarker = (coords) => {
     const features = vectorSourceRef.current.getFeatures();
@@ -234,7 +248,6 @@ export default function MapApp() {
     };
   };
 
-  // Fast Bounding Box Calculation for a single area-of-interest query
   const getAreaBoundingBox = (lat, lon, airportRadiusNM, campRadiusMiles) => {
     const totalMeters = (airportRadiusNM * 1852) + (campRadiusMiles * 1609.34);
     const latDelta = totalMeters / 111139;
@@ -283,7 +296,6 @@ export default function MapApp() {
     const [lon, lat] = centerCoords;
     const searchCampRadiusMeters = campRadiusMiles * 1609.34;
 
-    // STEP 1: Filter CSV airports first in local memory
     const matchingAirports = faaAirports.filter((apt) => {
       const distMeters = getDistanceInMeters(lon, lat, apt.lon, apt.lat);
       const distNM = distMeters / 1852;
@@ -309,7 +321,6 @@ export default function MapApp() {
       return;
     }
 
-    // STEP 2: Single Bounding Box query to Overpass for all area campsites
     setStatusLog(`Querying regional campsites for ${matchingAirports.length} candidate airports...`);
     const bbox = getAreaBoundingBox(lat, lon, airportRadiusMiles, campRadiusMiles);
     const campsiteData = await fetchAreaCampsites(bbox, controller.signal);
@@ -333,13 +344,11 @@ export default function MapApp() {
 
     setStatusLog(`Evaluating driving connections across ${allCampsites.length} campsites...`);
 
-    // STEP 3: Match campsites to airports locally using straight-line distance, then batch OSRM
     const evaluatedAirports = [];
 
     for (const apt of matchingAirports) {
       if (controller.signal.aborted) return;
 
-      // Filter campsites near THIS specific airport
       const nearbyCamps = allCampsites.filter((camp) => {
         const directMeters = getDistanceInMeters(apt.lon, apt.lat, camp.lon, camp.lat);
         return directMeters <= searchCampRadiusMeters;
@@ -477,6 +486,125 @@ export default function MapApp() {
     setStatusLog('Results cleared. Origin unlocked.');
   };
 
+  const handleSaveState = () => {
+    const originKey = `Origin (${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)})`;
+    const stateToSave = {
+      label: `${originKey} - ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+      centerCoords,
+      airportRadiusMiles,
+      campRadiusMiles,
+      maxQueriedAirportRadius,
+      maxQueriedCampRadius,
+      surfaceFilter,
+      accessFilter,
+      minRunwayLength,
+      cachedData,
+      isLocked
+    };
+
+    const updatedMap = { ...savedStates, [originKey]: stateToSave };
+    setSavedStates(updatedMap);
+    setSelectedSaveKey(originKey);
+    localStorage.setItem(MULTI_STORAGE_KEY, JSON.stringify(updatedMap));
+    setStatusLog(`Saved query for ${originKey}`);
+  };
+
+  const handleLoadState = () => {
+    if (!selectedSaveKey || !savedStates[selectedSaveKey]) return;
+    const parsed = savedStates[selectedSaveKey];
+
+    setCenterCoords(parsed.centerCoords);
+    setAirportRadiusMiles(parsed.airportRadiusMiles);
+    setCampRadiusMiles(parsed.campRadiusMiles);
+    setMaxQueriedAirportRadius(parsed.maxQueriedAirportRadius);
+    setMaxQueriedCampRadius(parsed.maxQueriedCampRadius);
+    setSurfaceFilter(parsed.surfaceFilter);
+    setAccessFilter(parsed.accessFilter);
+    setMinRunwayLength(parsed.minRunwayLength);
+    setCachedData(parsed.cachedData);
+    setIsLocked(parsed.isLocked);
+
+    if (mapRef.current && parsed.centerCoords) {
+      mapRef.current.getView().setCenter(fromLonLat(parsed.centerCoords));
+    }
+
+    if (parsed.cachedData) {
+      renderFilteredResults(
+        parsed.cachedData,
+        parsed.airportRadiusMiles,
+        parsed.campRadiusMiles,
+        parsed.surfaceFilter,
+        parsed.accessFilter,
+        parsed.minRunwayLength
+      );
+    } else {
+      updateOriginMarker(parsed.centerCoords);
+    }
+
+    setStatusLog(`Loaded saved query: ${parsed.label}`);
+  };
+
+  const handleRemoveAirport = (icaoOrId) => {
+    if (!cachedData) return;
+    const updatedAirports = cachedData.airports.filter(
+      (apt) => (apt.icao || apt.id || apt.name) !== icaoOrId
+    );
+
+    const updatedData = { ...cachedData, airports: updatedAirports };
+    setCachedData(updatedData);
+    renderFilteredResults(updatedData, airportRadiusMiles, campRadiusMiles, surfaceFilter, accessFilter, minRunwayLength);
+  };
+
+  const handleRemoveCampsite = (campId) => {
+    if (!cachedData) return;
+    const updatedAirports = cachedData.airports.map((apt) => ({
+      ...apt,
+      connections: apt.connections.filter(({ camp }) => camp.id !== campId)
+    })).filter((apt) => apt.connections.length > 0);
+
+    const updatedData = { ...cachedData, airports: updatedAirports };
+    setCachedData(updatedData);
+    renderFilteredResults(updatedData, airportRadiusMiles, campRadiusMiles, surfaceFilter, accessFilter, minRunwayLength);
+  };
+
+  const handleExportResults = () => {
+    if (results.airports.length === 0) return;
+
+    let textOutput = `========================================\n`;
+    textOutput += `RAMPCAMP TRIP PLANNING REPORT\n`;
+    textOutput += `Origin: ${centerCoords[1].toFixed(4)}, ${centerCoords[0].toFixed(4)}\n`;
+    textOutput += `Flight Radius: ${airportRadiusMiles} NM | Road Radius: ${campRadiusMiles} Mi\n`;
+    textOutput += `========================================\n\n`;
+
+    results.airports.forEach((apt, idx) => {
+      textOutput += `${idx + 1}. AIRPORT: ${apt.name} (${apt.icao || 'N/A'})\n`;
+      textOutput += `   Distance from Origin: ${apt.distFromCenterNM.toFixed(1)} NM\n`;
+      textOutput += `   Surface: ${apt.surface} | Runway: ${apt.lengthFeet || 'N/A'} ft\n`;
+      textOutput += `   Access: ${apt.isPublic ? 'Public' : 'Private'}\n`;
+      textOutput += `   Nearby Campsites:\n`;
+
+      const validConns = apt.connections.filter(
+        ({ route }) => parseFloat(route.distanceMiles) <= campRadiusMiles
+      );
+
+      validConns.forEach(({ camp, route }) => {
+        textOutput += `     - ${camp.name}\n`;
+        textOutput += `       Road Distance: ${route.distanceMiles} miles\n`;
+        textOutput += `       Fee: ${camp.fee} | Capacity: ${camp.capacity}\n`;
+        textOutput += `       Coordinates: ${camp.lat}, ${camp.lon}\n`;
+      });
+      textOutput += `----------------------------------------\n`;
+    });
+
+    const blob = new Blob([textOutput], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `rampcamp_itinerary_${Date.now()}.txt`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleAirportRadiusChange = (val) => {
     setAirportRadiusMiles(val);
     if (cachedData) {
@@ -511,6 +639,8 @@ export default function MapApp() {
       renderFilteredResults(cachedData, airportRadiusMiles, campRadiusMiles, surfaceFilter, accessFilter, val);
     }
   };
+
+  const savedKeysList = Object.keys(savedStates);
 
   return (
     <div className="app-container">
@@ -588,10 +718,74 @@ export default function MapApp() {
           </button>
         </div>
 
+        <div className="save-load-group">
+          <button onClick={handleSaveState} disabled={loading || !cachedData} className="btn-save">
+            Save Current Query
+          </button>
+          
+          <div className="load-select-wrapper">
+            <select 
+              value={selectedSaveKey} 
+              onChange={(e) => setSelectedSaveKey(e.target.value)}
+              className="select-saved"
+              disabled={savedKeysList.length === 0 || loading}
+            >
+              <option value="">Select Saved Query...</option>
+              {savedKeysList.map((key) => (
+                <option key={key} value={key}>
+                  {savedStates[key].label}
+                </option>
+              ))}
+            </select>
+            <button 
+              onClick={handleLoadState} 
+              disabled={!selectedSaveKey || loading} 
+              className="btn-load"
+            >
+              Load
+            </button>
+          </div>
+        </div>
+
+        <div className="action-buttons">
+          <button onClick={handleExportResults} disabled={results.airports.length === 0} className="btn-export">
+            Export Remaining Itinerary (.txt)
+          </button>
+        </div>
+
         <div className="status-card">{statusLog}</div>
 
-        <div className="sidebar-section">
-          <div className="section-title">Legend</div>
+        <div className="sidebar-section matches-section">
+          <div className="section-title">Matches ({results.airports.length} Airports, {results.campsites.length} Campsites)</div>
+          <div className="interactive-list">
+            {results.airports.map((apt) => {
+              const aptId = apt.icao || apt.id || apt.name;
+              return (
+                <div key={aptId} className="list-item-airport">
+                  <div className="item-header">
+                    <strong>✈ {apt.name} ({apt.icao || 'N/A'})</strong>
+                    <button onClick={() => handleRemoveAirport(aptId)} className="btn-remove" title="Remove Airport">✕</button>
+                  </div>
+                  <div className="campsite-sublist">
+                    {apt.connections
+                      .filter(({ route }) => parseFloat(route.distanceMiles) <= campRadiusMiles)
+                      .map(({ camp, route }) => (
+                        <div key={camp.id} className="list-item-campsite">
+                          <span>⛺ {camp.name} ({route.distanceMiles} mi)</span>
+                          <button onClick={() => handleRemoveCampsite(camp.id)} className="btn-remove-sm" title="Remove Campsite">✕</button>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="map-container" ref={mapElement}>
+        <div className="map-legend">
+          <div className="legend-title">Legend</div>
           <div className="legend-list">
             <div><span className="dot-origin">●</span> Origin Location</div>
             <div><span className="dot-airport">●</span> Airport</div>
@@ -601,14 +795,6 @@ export default function MapApp() {
           </div>
         </div>
 
-        <div className="sidebar-section">
-          <div className="section-title">Matches</div>
-          <div className="result-stat-airport">Airports: <strong>{results.airports.length}</strong></div>
-          <div className="result-stat-campsite">Campsites: <strong>{results.campsites.length}</strong></div>
-        </div>
-      </div>
-
-      <div className="map-container" ref={mapElement}>
         <div ref={tooltipElement} className="ol-tooltip">
           {tooltipData && (
             <>

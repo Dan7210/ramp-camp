@@ -185,12 +185,24 @@ html, body {
   font-size: 0.85rem;
 }
 
+.sidebar-section.matches-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 /* Legend items */
 .legend-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  font-size: 0.8rem;
+  gap: 4px;
+}
+
+.legend-title {
+  font-weight: bold;
+  margin-bottom: 6px;
+  color: #0f172a;
 }
 
 .dot-origin { color: #f43f5e; }
@@ -212,9 +224,24 @@ html, body {
 
 /* Map Wrapper */
 .map-container {
-  flex: 1;
-  height: 100vh;
   position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.map-legend {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.92);
+  color: black;
+  backdrop-filter: blur(4px);
+  padding: 10px 14px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  border: 1px solid #cbd5e1;
+  font-size: 11px;
 }
 
 /* OpenLayers Custom Tooltip Overlay */
@@ -259,4 +286,129 @@ html, body {
 .badge-campsite {
   background-color: #064e3b;
   color: #34d399;
+}
+
+.btn-save {
+  flex: 1;
+  background-color: #4f46e5;
+  color: #ffffff;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-load {
+  background-color: #4f46e5;
+  color: #ffffff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.btn-save:disabled, .btn-load:disabled, .btn-export:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-export {
+  width: 100%;
+  background-color: #059669;
+  color: #ffffff;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  margin-top: 6px;
+}
+
+.interactive-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-right: 4px;
+  color: black;
+}
+
+.list-item-airport {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.campsite-sublist {
+  margin-top: 6px;
+  padding-left: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.list-item-campsite {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: #475569;
+  font-size: 11px;
+}
+
+.btn-remove {
+  background: transparent;
+  color: #ef4444;
+  border: none;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-remove-sm {
+  background: transparent;
+  color: #94a3b8;
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.btn-remove-sm:hover {
+  color: #ef4444;
+}
+
+/* Save / Load Query Selectors */
+.save-load-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.select-saved {
+  flex: 1;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid #cbd5e1;
+  background-color: #f8fafc;
+  font-size: 12px;
+  font-weight: 500;
+  min-width: 0;
+}
+
+.load-select-wrapper {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
