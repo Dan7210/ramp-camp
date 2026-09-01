@@ -248,7 +248,7 @@ const fuelPlan = useMemo(() => {
     }
 
     return checks;
-  }, [missionPlan.waypoints, margins]);
+  }, [margins.safetyMultiplier, margins.takeoffDist, margins.landingDist, margins.alternateAirport, missionPlan.waypoints, missionPlan.legs]);
 
   const updatePerformance = (field, value) => {
     setPerformance((prev) => ({ ...prev, [field]: value }));
