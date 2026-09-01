@@ -22,21 +22,14 @@ const formatDuration = (hours) => {
 
 const findAirport = (waypoint) => {
   if (!waypoint) return null;
-  
-  // 1. Attempt ICAO / ID match first
   const searchId = (waypoint.icao || waypoint.id || '').replace(/^apt_/, '').toUpperCase();
   if (searchId && searchId !== 'ORIGIN_WP' && searchId !== 'N/A') {
-    const found = faaAirports.find((airport) =>
-      airport.icao?.toUpperCase() === searchId || airport.id?.toUpperCase() === searchId
-    );
+    const found = faaAirports.find((a) => a.icao?.toUpperCase() === searchId || a.id?.toUpperCase() === searchId);
     if (found) return found;
   }
-
-  // 2. Fallback: Match by coordinate proximity if waypoint has lat/lon
   if (waypoint.lat && waypoint.lon) {
     let closestApt = null;
     let minDistance = Infinity;
-
     faaAirports.forEach((apt) => {
       const dLat = apt.lat - waypoint.lat;
       const dLon = apt.lon - waypoint.lon;
@@ -46,61 +39,247 @@ const findAirport = (waypoint) => {
         closestApt = apt;
       }
     });
-
-    // Return match if within ~0.1 degrees (~6 NM)
     if (minDistance < 0.01) return closestApt;
   }
-
   return null;
 };
 
-const parseMetar = (raw, airportElevation = 0) => {
-  const text = raw || "";
-  const result = {
-    raw: text,
-    icao: '',
-    wind: 'Calm',
-    temp: null,
-    dewpoint: null,
+// Calculate Minimum and Maximum Crosswind Components across all runways
+const calculateCrosswinds = (windDir, windSpeed, windGust, runways) => {
+  if (windDir === null || windSpeed === null) return { min: 0, max: 0 };
+  const maxVelocity = windSpeed + (windGust ? (windGust - windSpeed) : 0);
+  if (windSpeed === 0 || windDir === 0) return { min: 0, max: 0 };
+  if (!runways || runways.length === 0) return { min: 0, max: maxVelocity };
+
+  let minCrosswind = Infinity;
+  let maxCrosswind = 0;
+
+  runways.forEach((rw) => {
+    const headings = [];
+    if (typeof rw === 'string') {
+      const match = rw.match(/\d+/g);
+      if (match) match.forEach(num => headings.push(parseInt(num, 10) * 10));
+    } else if (rw.heading) {
+      headings.push(rw.heading);
+      headings.push((rw.heading + 180) % 360);
+    }
+
+    headings.forEach((heading) => {
+      const angleRad = ((windDir - heading) * Math.PI) / 180;
+      const crosswind = Math.abs(maxVelocity * Math.sin(angleRad));
+      if (crosswind < minCrosswind) minCrosswind = crosswind;
+      if (crosswind > maxCrosswind) maxCrosswind = crosswind;
+    });
+  });
+
+  return {
+    min: minCrosswind === Infinity ? 0 : Math.round(minCrosswind),
+    max: Math.round(maxCrosswind)
+  };
+};
+
+// FAA Flight Category Evaluator
+const evaluateFlightCategory = (ceilingFeet, visibilitySm) => {
+  const c = ceilingFeet !== null ? ceilingFeet : Infinity;
+  const v = visibilitySm !== null ? visibilitySm : Infinity;
+
+  let ceilingCat = 'VFR';
+  if (c < 500) ceilingCat = 'LIFR';
+  else if (c < 1000) ceilingCat = 'IFR';
+  else if (c <= 3000) ceilingCat = 'MVFR';
+
+  let visCat = 'VFR';
+  if (v < 1) visCat = 'LIFR';
+  else if (v < 3) visCat = 'IFR';
+  else if (v <= 5) visCat = 'MVFR';
+
+  const order = { LIFR: 4, IFR: 3, MVFR: 2, VFR: 1 };
+  const category = order[ceilingCat] >= order[visCat] ? ceilingCat : visCat;
+
+  const ceilingStr = c === Infinity ? 'CLR/Unlimited' : `${c} ft`;
+  const visStr = v === Infinity ? 'Unrestricted' : `${v} SM`;
+
+  let reason = [];
+  if (category === 'VFR') {
+    reason.push(`Ceiling (${ceilingStr}) > 3,000 ft & Vis (${visStr}) > 5 SM`);
+  } else {
+    if (ceilingCat === category) reason.push(`Ceiling ${ceilingStr} (${ceilingCat})`);
+    if (visCat === category) reason.push(`Visibility ${visStr} (${visCat})`);
+  }
+
+  return { category, reason: reason.join(' & ') };
+};
+
+// Extracts active TAF group matching target UTC (Zulu) timestamp
+const extractActiveTafSegment = (rawTaf, targetUtcDate) => {
+  if (!rawTaf) return rawTaf;
+  const targetTime = targetUtcDate.getTime();
+
+  const parts = rawTaf.split(/(?=\b(?:FM\d{6}|TEMPO|BECMG)\b)/);
+  let selectedGroup = parts[0];
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const fmMatch = part.match(/FM(\d{2})(\d{2})(\d{2})/);
+    if (fmMatch) {
+      const now = new Date();
+      const fmDate = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), parseInt(fmMatch[1], 10), parseInt(fmMatch[2], 10), parseInt(fmMatch[3], 10));
+      if (targetTime >= fmDate) {
+        selectedGroup = part;
+      }
+    }
+  }
+  return selectedGroup;
+};
+
+// Parse raw METAR line
+const parseMetar = (rawText) => {
+  if (!rawText) return null;
+  const res = {
+    obsTime: null,
+    windDir: 0,
+    windSpeed: 0,
+    windGust: null,
+    windStr: 'Calm',
+    temp: 15,
+    dewpoint: 10,
     altimeter: 29.92,
-    pressureAlt: airportElevation,
-    densityAlt: airportElevation,
-    isParsed: false
+    visibility: 10,
+    ceiling: null
   };
 
-  try {
-    const icaoMatch = text.match(/^([A-Z]{4})/);
-    if (icaoMatch) result.icao = icaoMatch[1];
-
-    const windMatch = text.match(/(\d{3})(\d{2,3})(G\d{2})?KT/);
-    if (windMatch) {
-      const dir = windMatch[1];
-      const speed = windMatch[2];
-      const gust = windMatch[3] ? ` G${windMatch[3].replace('G', '')}` : '';
-      result.wind = `${dir}° at ${speed}kt${gust}`;
-    }
-
-    const tempMatch = text.match(/(\d{2})\/(\d{2})/);
-    if (tempMatch) {
-      result.temp = parseInt(tempMatch[1], 10);
-      result.dewpoint = parseInt(tempMatch[2], 10);
-    }
-
-    const altMatch = text.match(/A(\d{4})/);
-    if (altMatch) {
-      result.altimeter = parseInt(altMatch[1], 10) / 100;
-    }
-
-    result.pressureAlt = ((29.92 - result.altimeter) * 1000) + airportElevation;
-
-    if (result.temp !== null) {
-      const isaTemp = 15 - (2 * (airportElevation / 1000));
-      result.densityAlt = result.pressureAlt + (120 * (result.temp - isaTemp));
-      result.isParsed = true;
-    }
-  } catch (e) {
-    console.error("METAR Parsing error", e);
+  const timeMatch = rawText.match(/(\d{2})(\d{2})(\d{2})Z/);
+  if (timeMatch) {
+    const now = new Date();
+    res.obsTime = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), parseInt(timeMatch[1], 10), parseInt(timeMatch[2], 10), parseInt(timeMatch[3], 10)));
   }
+
+  const windMatch = rawText.match(/(VRB|\d{3})(\d{2,3})(G\d{2,3})?KT/);
+  if (windMatch) {
+    res.windDir = windMatch[1] === 'VRB' ? 0 : parseInt(windMatch[1], 10);
+    res.windSpeed = parseInt(windMatch[2], 10);
+    res.windGust = windMatch[3] ? parseInt(windMatch[3].replace('G', ''), 10) : null;
+    res.windStr = res.windSpeed === 0 ? 'Calm' : `${windMatch[1]}° at ${res.windSpeed}kt${res.windGust ? ` G${res.windGust}kt` : ''}`;
+  }
+
+  const tempMatch = rawText.match(/(M?\d{2})\/(M?\d{2})/);
+  if (tempMatch) {
+    res.temp = parseInt(tempMatch[1].replace('M', '-'), 10);
+    res.dewpoint = parseInt(tempMatch[2].replace('M', '-'), 10);
+  }
+
+  const altMatch = rawText.match(/A(\d{4})/);
+  if (altMatch) res.altimeter = parseInt(altMatch[1], 10) / 100;
+
+  const visMatch = rawText.match(/(P?\d+\/\d+|P?\d+)\s*SM/);
+  if (visMatch) {
+    const v = visMatch[1].replace('P', '');
+    res.visibility = v.includes('/') ? v.split('/')[0] / v.split('/')[1] : parseInt(v, 10);
+  }
+
+  const cloudMatches = [...rawText.matchAll(/(BKN|OVC)(\d{3})/g)];
+  if (cloudMatches.length > 0) {
+    res.ceiling = Math.min(...cloudMatches.map(m => parseInt(m[2], 10) * 100));
+  }
+
+  return res;
+};
+
+// Blends METAR base with superceding TAF/MOS forecasts
+const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
+  const elev = apt?.elevationFeet || apt?.elevation || 0;
+  const targetUtcDate = targetEtdIso ? new Date(targetEtdIso) : new Date();
+
+  // 1. Base State from METAR
+  const metarData = parseMetar(rawMetar);
+  
+  const result = {
+    icao: apt?.icao || apt?.id || 'UNKNOWN',
+    rawMetar: rawMetar || 'No METAR available',
+    rawForecast: null,
+    isStale: false,
+    sources: {
+      wind: 'METAR',
+      visibility: 'METAR',
+      ceiling: 'METAR',
+      densityAlt: 'METAR'
+    },
+    windDir: metarData?.windDir || 0,
+    windSpeed: metarData?.windSpeed || 0,
+    windGust: metarData?.windGust || null,
+    windStr: metarData?.windStr || 'Calm',
+    temp: metarData?.temp ?? 15,
+    dewpoint: metarData?.dewpoint ?? 10,
+    altimeter: metarData?.altimeter ?? 29.92,
+    visibility: metarData?.visibility ?? 10,
+    ceiling: metarData?.ceiling ?? null,
+    pressureAlt: elev,
+    densityAlt: elev,
+    minCrosswind: 0,
+    maxCrosswind: 0,
+    flightCategory: { category: 'VFR', reason: '' }
+  };
+
+  if (metarData?.obsTime) {
+    const diffMinutes = (targetUtcDate.getTime() - metarData.obsTime.getTime()) / (1000 * 60);
+    if (diffMinutes > 30) result.isStale = true;
+  }
+
+  // 2. Override forecastable items via TAF or MOS if available
+  let activeForecastText = null;
+  let forecastType = null;
+
+  if (rawTaf) {
+    activeForecastText = extractActiveTafSegment(rawTaf, targetUtcDate);
+    forecastType = 'TAF';
+  } else if (rawMos) {
+    activeForecastText = rawMos;
+    forecastType = 'MOS';
+  }
+
+  if (activeForecastText) {
+    result.rawForecast = `${forecastType}: ${activeForecastText.trim()}`;
+
+    // Supercede Wind
+    const fWind = activeForecastText.match(/(VRB|\d{3})(\d{2,3})(G\d{2,3})?KT/);
+    if (fWind) {
+      result.windDir = fWind[1] === 'VRB' ? 0 : parseInt(fWind[1], 10);
+      result.windSpeed = parseInt(fWind[2], 10);
+      result.windGust = fWind[3] ? parseInt(fWind[3].replace('G', ''), 10) : null;
+      result.windStr = result.windSpeed === 0 ? 'Calm' : `${fWind[1]}° at ${result.windSpeed}kt${result.windGust ? ` G${result.windGust}kt` : ''}`;
+      result.sources.wind = forecastType;
+    }
+
+    // Supercede Visibility
+    const fVis = activeForecastText.match(/(P?\d+\/\d+|P?\d+)\s*SM/);
+    if (fVis) {
+      const v = fVis[1].replace('P', '');
+      result.visibility = v.includes('/') ? v.split('/')[0] / v.split('/')[1] : parseInt(v, 10);
+      result.sources.visibility = forecastType;
+    }
+
+    // Supercede Ceiling
+    const fClouds = [...activeForecastText.matchAll(/(BKN|OVC)(\d{3})/g)];
+    if (fClouds.length > 0) {
+      result.ceiling = Math.min(...fClouds.map(m => parseInt(m[2], 10) * 100));
+      result.sources.ceiling = forecastType;
+    } else if (activeForecastText.includes('SKC') || activeForecastText.includes('CLR') || activeForecastText.includes('FEW') || activeForecastText.includes('SCT')) {
+      result.ceiling = null;
+      result.sources.ceiling = forecastType;
+    }
+  }
+
+  // Derived Calculations
+  result.pressureAlt = Math.round(((29.92 - result.altimeter) * 1000) + elev);
+  const isaTemp = 15 - (1.98 * (elev / 1000));
+  result.densityAlt = Math.round(result.pressureAlt + (120 * (result.temp - isaTemp)));
+
+  const xw = calculateCrosswinds(result.windDir, result.windSpeed, result.windGust, apt?.runways);
+  result.minCrosswind = xw.min;
+  result.maxCrosswind = xw.max;
+
+  result.flightCategory = evaluateFlightCategory(result.ceiling, result.visibility);
+
   return result;
 };
 
@@ -118,43 +297,41 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     landingDist: 0,
     safetyMultiplier: 1.5,
     gasMarginMinutes: 30,
-    alternateAirport: null, // Holds the full airport object
+    alternateAirport: null,
     alternateSearchQuery: ''
   });
 
   const [isMarginManual, setIsMarginManual] = useState(false);
   const [altSearchResults, setAltSearchResults] = useState([]);
 
-  const [weather, setWeather] = useState({ status: 'Not requested', metars: [], tafs: [] });
+  const [weather, setWeather] = useState({ reports: [] });
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState('');
   const [notamsReviewed, setNotamsReviewed] = useState(false);
 
-  const destination = missionPlan.waypoints.at(-1);
-  const destinationAirport = findAirport(destination);
-  
-  const allAirportIds = useMemo(() => [...new Set(
-    missionPlan.waypoints
-      .filter((waypoint) => waypoint.type === 'airport' && waypoint.icao && waypoint.icao !== 'N/A')
-      .map((waypoint) => waypoint.icao)
-  )], [missionPlan.waypoints]);
+  const departureAirport = useMemo(() => findAirport(missionPlan.waypoints?.[0] || missionPlan.legs?.[0]?.start), [missionPlan]);
+  const destinationAirport = useMemo(() => findAirport(missionPlan.waypoints.at(-1)), [missionPlan]);
+
+  const relevantAirports = useMemo(() => {
+    return [
+      { role: 'Departure', apt: departureAirport },
+      { role: 'Arrival', apt: destinationAirport },
+      { role: 'Alternate', apt: margins.alternateAirport }
+    ].filter(item => item.apt !== null);
+  }, [departureAirport, destinationAirport, margins.alternateAirport]);
 
   const activeGasMargin = useMemo(() => {
     if (isMarginManual) return toNumber(margins.gasMarginMinutes);
-
     const startTime = new Date(etd);
     const totalFlightHours = missionPlan.legs.reduce((acc, leg) => acc + (leg.distNM / (performance.cruiseKt || 100)), 0);
     const endTime = new Date(startTime.getTime() + totalFlightHours * 3600000);
-
-    const bothDay = isDaytime(startTime) && isDaytime(endTime);
-    return bothDay ? 30 : 45;
+    return (isDaytime(startTime) && isDaytime(endTime)) ? 30 : 45;
   }, [etd, missionPlan.legs, performance.cruiseKt, isMarginManual, margins.gasMarginMinutes]);
 
-const fuelPlan = useMemo(() => {
+  const fuelPlan = useMemo(() => {
     const rows = missionPlan.legs.map((leg, index) => {
       const selectedAltitude = toNumber(leg.selectedMslFeet);
 
-      // Determine starting altitude (MSL) for the climb portion
       let previousAltitude;
       if (index === 0) {
         const originAirport = findAirport(leg.start);
@@ -163,7 +340,6 @@ const fuelPlan = useMemo(() => {
         previousAltitude = toNumber(missionPlan.legs[index - 1].selectedMslFeet);
       }
 
-      // Determine ending altitude (MSL) for the descent portion
       let nextAltitude;
       if (index === missionPlan.legs.length - 1) {
         const destAirport = findAirport(leg.end);
@@ -206,16 +382,9 @@ const fuelPlan = useMemo(() => {
     const baseHours = rows.reduce((total, leg) => total + leg.hours, 0);
     const baseGallons = rows.reduce((total, leg) => total + leg.gallons, 0);
     const totalDist = rows.reduce((total, leg) => total + leg.distNM, 0);
-
     const marginGallons = (activeGasMargin / 60) * toNumber(performance.cruiseGph);
 
-    return {
-      rows,
-      totalHours: baseHours,
-      totalGallons: baseGallons + marginGallons,
-      totalDist: totalDist,
-      marginGallons: marginGallons
-    };
+    return { rows, totalHours: baseHours, totalGallons: baseGallons + marginGallons, totalDist, marginGallons };
   }, [missionPlan.legs, performance, activeGasMargin]);
 
   const runwaySafety = useMemo(() => {
@@ -235,24 +404,19 @@ const fuelPlan = useMemo(() => {
       });
     };
 
-    const origin = findAirport(missionPlan.waypoints?.[0]) || findAirport(missionPlan.legs?.[0]?.start);
-    checkRunway(origin, 'Origin (Takeoff)', tDistReq);
-
-    const dest = findAirport(missionPlan.waypoints.at(-1));
-    checkRunway(dest, 'Dest (Takeoff)', tDistReq);
-    checkRunway(dest, 'Dest (Landing)', lDistReq);
+    checkRunway(departureAirport, 'Origin (Takeoff)', tDistReq);
+    checkRunway(destinationAirport, 'Destination (Takeoff)', tDistReq);
+    checkRunway(destinationAirport, 'Destination (Landing)', lDistReq);
 
     if (margins.alternateAirport) {
-      checkRunway(margins.alternateAirport, 'Alt (Takeoff)', tDistReq);
-      checkRunway(margins.alternateAirport, 'Alt (Landing)', lDistReq);
+      checkRunway(margins.alternateAirport, 'Alternate (Takeoff)', tDistReq);
+      checkRunway(margins.alternateAirport, 'Alternate (Landing)', lDistReq);
     }
 
     return checks;
-  }, [margins.safetyMultiplier, margins.takeoffDist, margins.landingDist, margins.alternateAirport, missionPlan.waypoints, missionPlan.legs]);
+  }, [margins.safetyMultiplier, margins.takeoffDist, margins.landingDist, departureAirport, destinationAirport, margins.alternateAirport]);
 
-  const updatePerformance = (field, value) => {
-    setPerformance((prev) => ({ ...prev, [field]: value }));
-  };
+  const updatePerformance = (field, value) => setPerformance((prev) => ({ ...prev, [field]: value }));
 
   const updateMargin = (field, value) => {
     setMargins((prev) => ({ ...prev, [field]: value }));
@@ -269,7 +433,7 @@ const fuelPlan = useMemo(() => {
     const matches = faaAirports
       .filter(a => a.icao?.toLowerCase().includes(q) || a.name?.toLowerCase().includes(q))
       .slice(0, 5)
-      .map(a => ({ id: a.icao || a.id, name: a.name, icao: a.icao, lengthFeet: a.lengthFeet, surface: a.surface }));
+      .map(a => ({ id: a.icao || a.id, name: a.name, icao: a.icao, lengthFeet: a.lengthFeet, surface: a.surface, elevationFeet: a.elevationFeet }));
     setAltSearchResults(matches);
   };
 
@@ -279,27 +443,49 @@ const fuelPlan = useMemo(() => {
   };
 
   const loadWeather = async () => {
-    if (allAirportIds.length === 0) return;
+    const icaos = relevantAirports.map(r => r.apt?.icao || r.apt?.id).filter(Boolean);
+    if (icaos.length === 0) return;
+
     setWeatherLoading(true);
     setWeatherError('');
+
     try {
-      const ids = encodeURIComponent(allAirportIds.join(','));
-      const [metarRes, tafRes] = await Promise.all([
-        fetch(`/aviationweather/metar?ids=${ids}&format=json&taf=false`),
-        fetch(`/aviationweather/taf?ids=${ids}&format=json`)
+      const ids = encodeURIComponent([...new Set(icaos)].join(','));
+      const [metarRes, tafRes, mosRes] = await Promise.all([
+        fetch(`/aviationweather/metar?ids=${ids}&format=json`),
+        fetch(`/aviationweather/taf?ids=${ids}&format=json`).catch(() => ({ ok: false })),
+        fetch(`/aviationweather/mos?ids=${ids}&format=json`).catch(() => ({ ok: false }))
       ]);
-      if (!metarRes.ok || !tafRes.ok) throw new Error('Aviation Weather service unavailable.');
-      const [metars, tafs] = await Promise.all([metarRes.json(), tafRes.json()]);
-      const processedMetars = (Array.isArray(metars) ? metars : []).map(m => {
-        const airport = findAirport({ icao: m.icaoId });
-        const elev = airport?.elevation || airport?.msl || airport?.alt || 0;
-        return parseMetar(m.rawOb || m.raw_text, elev);
+
+      const metars = metarRes.ok ? await metarRes.json() : [];
+      const tafs = tafRes.ok ? await tafRes.json() : [];
+      const mos = mosRes.ok ? await mosRes.json() : [];
+
+      const reports = relevantAirports.map(({ role, apt }) => {
+        const id = (apt?.icao || apt?.id || '').toUpperCase();
+        const rawM = (Array.isArray(metars) ? metars : []).find(m => m.icaoId?.toUpperCase() === id)?.rawOb;
+        const rawT = (Array.isArray(tafs) ? tafs : []).find(t => t.icaoId?.toUpperCase() === id)?.rawTAF;
+        const rawMo = (Array.isArray(mos) ? mos : []).find(m => m.icaoId?.toUpperCase() === id)?.rawMOS;
+
+        const blended = buildBlendedWeather(apt, rawM, rawT, rawMo, etd);
+        return { role, apt, ...blended };
       });
-      setWeather({ status: `Updated for ${etd}`, metars: processedMetars, tafs: Array.isArray(tafs) ? tafs : [] });
-    } catch (error) {
-      setWeatherError(error instanceof Error ? error.message : 'Unable to retrieve weather.');
+
+      setWeather({ reports });
+    } catch {
+      setWeatherError('Failed to fetch weather telemetry.');
     } finally {
       setWeatherLoading(false);
+    }
+  };
+
+  const getCategoryClass = (cat) => {
+    switch (cat) {
+      case 'VFR': return 'cat-badge-vfr';
+      case 'MVFR': return 'cat-badge-mvfr';
+      case 'IFR': return 'cat-badge-ifr';
+      case 'LIFR': return 'cat-badge-lifr';
+      default: return '';
     }
   };
 
@@ -310,7 +496,7 @@ const fuelPlan = useMemo(() => {
         <button type="button" className="btn-back" onClick={onBack}>← Back</button>
 
         <label className="briefing-label">
-          ETD
+          ETD (Local)
           <input type="datetime-local" value={etd} onChange={(e) => setEtd(e.target.value)} />
         </label>
 
@@ -382,9 +568,8 @@ const fuelPlan = useMemo(() => {
         </section>
 
         <section className="briefing-section">
-          <h3 className="sidebar-h3">Weather Data</h3>
           <button type="button" className="btn-plan-sm" onClick={loadWeather} disabled={weatherLoading}>
-            {weatherLoading ? 'Loading...' : 'Refresh METAR/TAF'}
+            {weatherLoading ? 'Updating Weather...' : 'Refresh Weather'}
           </button>
         </section>
       </aside>
@@ -392,7 +577,7 @@ const fuelPlan = useMemo(() => {
       <main className="nwkraft-content">
         <header>
           <h1>NWKRAFT Mission Briefing</h1>
-          <p>ETD: {etd} | NOTAM Review: {notamsReviewed ? '✅' : '❌'}</p>
+          <p>ETD Target UTC: {new Date(etd).toISOString().replace('.000', '')} | NOTAM Review: {notamsReviewed ? '✅' : '❌'}</p>
         </header>
 
         <section className="briefing-section notam-section">
@@ -407,25 +592,50 @@ const fuelPlan = useMemo(() => {
         </section>
 
         <section className="briefing-section">
-          <h3 className="section-h3">Weather (METAR/TAF)</h3>
+          <h3 className="section-h3">Terminal Weather Breakdown</h3>
           {weatherError && <p className="briefing-error">{weatherError}</p>}
-          <div className="weather-grid">
-            {weather.metars.map((m, i) => (
-              <div key={i} className="weather-card">
-                <div className="weather-card-header"><strong>{m.icao}</strong></div>
-                {m.isParsed ? (
-                  <div className="weather-plain-english">
-                    <p className="wind-line">🌬️ {m.wind}</p>
-                    <p className="temp-line">🌡️ {m.temp}°C / Dew: {m.dewpoint}°C</p>
-                    <div className="alt-line">
-                      <span>P-Alt: <strong>{Math.round(m.pressureAlt)}'</strong></span>
-                      <span>D-Alt: <strong>{Math.round(m.densityAlt)}'</strong></span>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '16px' }}>
+            {weather.reports.length > 0 ? (
+              weather.reports.map((m, i) => (
+                <div key={i} style={{ background: '#1e293b', padding: '16px', borderRadius: '8px', border: '1px solid #334155' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <strong>{m.role}: {m.icao}</strong>
+                    <span className={`cat-badge ${getCategoryClass(m.flightCategory.category)}`}>
+                      {m.flightCategory.category}
+                    </span>
+                  </div>
+
+                  {m.isStale && (
+                    <div style={{ background: '#78350f', color: '#fef08a', padding: '4px 8px', borderRadius: '4px', fontSize: '11px', marginBottom: '8px' }}>
+                      ⚠️ METAR &gt;30m past observation time.
+                    </div>
+                  )}
+
+                  <div style={{ fontSize: '13px', display: 'grid', gap: '6px' }}>
+                    <p><strong>Reason:</strong> {m.flightCategory.reason}</p>
+                    <p>🌬️ <strong>Wind:</strong> {m.windStr} <span className="source-tag">[{m.sources.wind}]</span></p>
+                    <p>📐 <strong>Crosswind Range:</strong> {m.minCrosswind} kt (Min) — {m.maxCrosswind} kt (Max)</p>
+                    <p>👁️ <strong>Visibility:</strong> {m.visibility} SM <span className="source-tag">[{m.sources.visibility}]</span></p>
+                    <p>☁️ <strong>Ceiling:</strong> {m.ceiling ? `${m.ceiling} ft` : 'CLR/Unlimited'} <span className="source-tag">[{m.sources.ceiling}]</span></p>
+                    <p>🌡️ <strong>Temp / Dewpoint:</strong> {m.temp}°C / {m.dewpoint}°C <span className="source-tag">[METAR]</span></p>
+                    <p>🎚️ <strong>Altimeter:</strong> {m.altimeter.toFixed(2)} inHg <span className="source-tag">[METAR]</span></p>
+
+                    <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'space-between' }}>
+                      <span>P-Alt: <strong>{m.pressureAlt.toLocaleString()}'</strong></span>
+                      <span>D-Alt: <strong>{m.densityAlt.toLocaleString()}'</strong></span>
                     </div>
                   </div>
-                ) : <p className="parsing-error">Unable to parse METAR</p>}
-                <div className="weather-encoded-small"><pre>{m.raw}</pre></div>
-              </div>
-            ))}
+
+                  <div style={{ marginTop: '10px', fontSize: '11px', background: '#0f172a', padding: '6px', borderRadius: '4px', overflowX: 'auto' }}>
+                    <code>METAR: {m.rawMetar}</code>
+                    {m.rawForecast && <code style={{ display: 'block', marginTop: '4px', color: '#38bdf8' }}>{m.rawForecast}</code>}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="empty-msg">Click "Refresh Weather" to load combined weather reports.</p>
+            )}
           </div>
         </section>
 
@@ -445,26 +655,6 @@ const fuelPlan = useMemo(() => {
             )) : <p className="empty-msg">Enter takeoff/landing distances to validate runway lengths.</p>}
           </div>
         </section>
-
-        <section className="briefing-section">
-          <h3 className="section-h3">Destination</h3>
-          {destinationAirport ? (
-            <div className="dest-card">
-              <strong>{destinationAirport.icao || destinationAirport.id}</strong> — {destinationAirport.name}<br/>
-              Runway: {destinationAirport.lengthFeet?.toLocaleString() || 'N/A'} ft ({destinationAirport.surface || 'unknown'})
-            </div>
-          ) : <p>No destination info.</p>}
-        </section>
-
-        {margins.alternateAirport && (
-          <section className="briefing-section">
-            <h3 className="section-h3">Alternate</h3>
-            <div className="dest-card">
-              <strong>{margins.alternateAirport.icao || margins.alternateAirport.id}</strong> — {margins.alternateAirport.name}<br/>
-              Runway: {margins.alternateAirport.lengthFeet?.toLocaleString() || 'N/A'} ft ({margins.alternateAirport.surface || 'unknown'})
-            </div>
-          </section>
-        )}
 
         <section className="briefing-section">
           <h3 className="section-h3">Required Fuel Projection</h3>
