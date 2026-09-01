@@ -22,9 +22,36 @@ const formatDuration = (hours) => {
 
 const findAirport = (waypoint) => {
   if (!waypoint) return null;
-  return faaAirports.find((airport) =>
-    airport.icao === waypoint.icao || airport.id === waypoint.icao || airport.id === waypoint.id?.replace(/^apt_/, '')
-  );
+  
+  // 1. Attempt ICAO / ID match first
+  const searchId = (waypoint.icao || waypoint.id || '').replace(/^apt_/, '').toUpperCase();
+  if (searchId && searchId !== 'ORIGIN_WP' && searchId !== 'N/A') {
+    const found = faaAirports.find((airport) =>
+      airport.icao?.toUpperCase() === searchId || airport.id?.toUpperCase() === searchId
+    );
+    if (found) return found;
+  }
+
+  // 2. Fallback: Match by coordinate proximity if waypoint has lat/lon
+  if (waypoint.lat && waypoint.lon) {
+    let closestApt = null;
+    let minDistance = Infinity;
+
+    faaAirports.forEach((apt) => {
+      const dLat = apt.lat - waypoint.lat;
+      const dLon = apt.lon - waypoint.lon;
+      const distSq = dLat * dLat + dLon * dLon;
+      if (distSq < minDistance) {
+        minDistance = distSq;
+        closestApt = apt;
+      }
+    });
+
+    // Return match if within ~0.1 degrees (~6 NM)
+    if (minDistance < 0.01) return closestApt;
+  }
+
+  return null;
 };
 
 const parseMetar = (raw, airportElevation = 0) => {
@@ -208,7 +235,7 @@ const fuelPlan = useMemo(() => {
       });
     };
 
-    const origin = findAirport(missionPlan.waypoints[0]);
+    const origin = findAirport(missionPlan.waypoints?.[0]) || findAirport(missionPlan.legs?.[0]?.start);
     checkRunway(origin, 'Origin (Takeoff)', tDistReq);
 
     const dest = findAirport(missionPlan.waypoints.at(-1));

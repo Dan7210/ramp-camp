@@ -713,14 +713,14 @@ export default function MapApp() {
 
   // Fixed payload format to provide both array & object formats for origin coordinates
   const handleSelectMission = (airport, camp, route) => {
-    // Standardize airport coordinates
+    const nearestOriginApt = findNearestAirport(centerCoords);
+
     const normalizedAirport = {
       ...airport,
       lon: airport.lon ?? airport.longitude ?? airport.lng,
       lat: airport.lat ?? airport.latitude
     };
 
-    // Standardize campsite coordinates
     const normalizedCamp = {
       ...camp,
       lon: camp.lon ?? camp.longitude ?? camp.lng,
@@ -730,7 +730,9 @@ export default function MapApp() {
     setSelectedMission({
       origin: {
         lon: centerCoords[0],
-        lat: centerCoords[1]
+        lat: centerCoords[1],
+        icao: nearestOriginApt?.icao,
+        name: nearestOriginApt?.name
       },
       originCoords: centerCoords,
       airport: normalizedAirport,

@@ -95,32 +95,38 @@ const createInitialWaypoints = (missionData) => {
   const airport = extractCoords(missionData?.airport);
   if (!origin || !airport) return [];
 
-  let originName = 'Origin Marker';
-  let originIcao = '';
-  let minDistance = 30; // Search for origin airport within 30NM
+  let nearestAirport = null;
+  let minDistance = Infinity;
 
+  // Find the absolute nearest airport to origin coordinates
   faaAirports.forEach((apt) => {
     const dist = calculateNM(origin, { lat: apt.lat, lon: apt.lon });
     if (dist < minDistance) {
       minDistance = dist;
-      originName = apt.name;
-      originIcao = apt.icao;
+      nearestAirport = apt;
     }
   });
 
+  const originIcao = nearestAirport?.icao || nearestAirport?.id || '';
+  const originName = nearestAirport 
+    ? `${nearestAirport.name} (${originIcao})` 
+    : `Origin (${origin.lat.toFixed(3)}, ${origin.lon.toFixed(3)})`;
+
   return [
     { 
-      id: 'origin_wp', 
-      name: originIcao ? `${originName} (${originIcao})` : originName, 
+      id: nearestAirport ? `apt_${originIcao}` : 'origin_wp', 
+      name: originName, 
       type: 'origin', 
-      icao: '',
+      icao: originIcao,
+      surface: nearestAirport?.surface || 'Unknown',
+      lengthFeet: nearestAirport?.lengthFeet || null,
       ...origin 
     },
     {
       id: `apt_${missionData.airport.icao || missionData.airport.id || 'dest'}`,
       name: missionData.airport.name || 'Destination Airport',
       type: 'airport',
-      icao: missionData.airport.icao || 'N/A',
+      icao: missionData.airport.icao || missionData.airport.id || 'N/A',
       surface: missionData.airport.surface || 'Unknown',
       lengthFeet: missionData.airport.lengthFeet || null,
       ...airport
