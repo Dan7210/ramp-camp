@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState } from 'react';
 import faaAirports from './airports.json';
 import './MissionBriefing.css';
 
@@ -89,13 +89,12 @@ export default function MissionBriefing({ missionPlan, onBack }) {
   const [margins, setMargins] = useState({
     takeoffDist: 0,
     landingDist: 0,
-    safetyMultiplier: 1.0,
+    safetyMultiplier: 1.5,
     gasMarginMinutes: 30,
     alternateAirport: null, // Holds the full airport object
     alternateSearchQuery: ''
   });
 
-  // We use this to track if the user has touched the gas margin
   const [isMarginManual, setIsMarginManual] = useState(false);
   const [altSearchResults, setAltSearchResults] = useState([]);
 
@@ -113,11 +112,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
       .map((waypoint) => waypoint.icao)
   )], [missionPlan.waypoints]);
 
-  /**
-   * DERIVED STATE: Gas Margin
-   * Prevents "Cascading Renders" error by calculating the value during render
-   * instead of using an effect to call setState.
-   */
   const activeGasMargin = useMemo(() => {
     if (isMarginManual) return toNumber(margins.gasMarginMinutes);
 
@@ -129,15 +123,31 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     return bothDay ? 30 : 45;
   }, [etd, missionPlan.legs, performance.cruiseKt, isMarginManual, margins.gasMarginMinutes]);
 
-  const fuelPlan = useMemo(() => {
+const fuelPlan = useMemo(() => {
     const rows = missionPlan.legs.map((leg, index) => {
       const selectedAltitude = toNumber(leg.selectedMslFeet);
-      const previousAltitude = index === 0 ? 0 : toNumber(missionPlan.legs[index - 1].selectedMslFeet);
-      const nextAltitude = index === missionPlan.legs.length - 1 ? 0 : toNumber(missionPlan.legs[index + 1].selectedMslFeet);
-      
+
+      // Determine starting altitude (MSL) for the climb portion
+      let previousAltitude;
+      if (index === 0) {
+        const originAirport = findAirport(leg.start);
+        previousAltitude = originAirport ? toNumber(originAirport.elevationFeet) : 0;
+      } else {
+        previousAltitude = toNumber(missionPlan.legs[index - 1].selectedMslFeet);
+      }
+
+      // Determine ending altitude (MSL) for the descent portion
+      let nextAltitude;
+      if (index === missionPlan.legs.length - 1) {
+        const destAirport = findAirport(leg.end);
+        nextAltitude = destAirport ? toNumber(destAirport.elevationFeet) : 0;
+      } else {
+        nextAltitude = toNumber(missionPlan.legs[index + 1].selectedMslFeet);
+      }
+
       const climbFeet = Math.max(0, selectedAltitude - previousAltitude);
       const descentFeet = Math.max(0, selectedAltitude - nextAltitude);
-      
+
       const climbHours = climbFeet / Math.max(1, toNumber(performance.climbFpm)) / 60;
       const climbDist = climbHours * toNumber(performance.climbKt);
       const climbGal = climbHours * toNumber(performance.climbGph);
@@ -155,7 +165,9 @@ export default function MissionBriefing({ missionPlan, onBack }) {
 
       return { 
         ...leg, 
-        climbFeet, descentFeet, cruiseDistance, 
+        climbFeet, 
+        descentFeet, 
+        cruiseDistance, 
         climb: { h: climbHours, g: climbGal },
         cruise: { h: cruiseHours, g: cruiseGal },
         descent: { h: descentHours, g: descentGal },
@@ -168,7 +180,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     const baseGallons = rows.reduce((total, leg) => total + leg.gallons, 0);
     const totalDist = rows.reduce((total, leg) => total + leg.distNM, 0);
 
-    // Use the derived activeGasMargin
     const marginGallons = (activeGasMargin / 60) * toNumber(performance.cruiseGph);
 
     return {
@@ -180,9 +191,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     };
   }, [missionPlan.legs, performance, activeGasMargin]);
 
-  /**
-   * DERIVED STATE: Runway Safety
-   */
   const runwaySafety = useMemo(() => {
     const checks = [];
     const multiplier = toNumber(margins.safetyMultiplier);
@@ -200,16 +208,13 @@ export default function MissionBriefing({ missionPlan, onBack }) {
       });
     };
 
-    // 1. Origin (Takeoff only)
     const origin = findAirport(missionPlan.waypoints[0]);
     checkRunway(origin, 'Origin (Takeoff)', tDistReq);
 
-    // 2. Destination (Landing & Takeoff)
     const dest = findAirport(missionPlan.waypoints.at(-1));
     checkRunway(dest, 'Dest (Takeoff)', tDistReq);
     checkRunway(dest, 'Dest (Landing)', lDistReq);
 
-    // 3. Alternate (Landing & Takeoff)
     if (margins.alternateAirport) {
       checkRunway(margins.alternateAirport, 'Alt (Takeoff)', tDistReq);
       checkRunway(margins.alternateAirport, 'Alt (Landing)', lDistReq);
@@ -227,7 +232,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     if (field === 'gasMarginMinutes') setIsMarginManual(true);
   };
 
-  // Alternate Search Handlers
   const handleAlternateSearch = (val) => {
     setMargins(prev => ({ ...prev, alternateSearchQuery: val }));
     if (val.length < 2) {
@@ -284,7 +288,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         </label>
 
         <section className="briefing-section">
-          <h3 className="sidebar-h3">Performance</h3>
+          <h3 className="sidebar-h3">Aircraft Performance</h3>
           <div className="performance-grid">
             {[
               ['climbKt', 'Climb KTAS'], ['climbGph', 'Climb GPH'], ['climbFpm', 'Climb fpm'],
@@ -299,18 +303,18 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         </section>
 
         <section className="briefing-section">
-          <h3 className="sidebar-h3">Margins</h3>
+          <h3 className="sidebar-h3">Options</h3>
           <div className="performance-grid">
             {[
-              ['takeoffDist', 'Takeoff (ft)'],
-              ['landingDist', 'Landing (ft)'],
-              ['safetyMultiplier', 'FICON Mult'],
+              ['takeoffDist', 'Takeoff Distance (ft)'],
+              ['landingDist', 'Landing Distance (ft)'],
+              ['safetyMultiplier', 'FICON Multiplier'],
               ['gasMarginMinutes', 'Gas Margin (min)']
             ].map(([field, label]) => (
               <label key={field} className="briefing-label">{label}
                 <input 
                   type="number" 
-                  step={field === 'safetyMultiplier' ? '0.1' : '1'} 
+                  step={field === 'safetyMultiplier' ? '0.1' : '1.5'} 
                   value={isMarginManual && field === 'gasMarginMinutes' ? margins.gasMarginMinutes : (field === 'gasMarginMinutes' ? activeGasMargin : margins[field])} 
                   onChange={(e) => updateMargin(field, e.target.value)} 
                 />
@@ -318,24 +322,26 @@ export default function MissionBriefing({ missionPlan, onBack }) {
             ))}
           </div>
 
-          <div className="briefing-label" style={{ marginTop: '12px', position: 'relative' }}>
+          <div className="briefing-label" style={{ marginTop: '12px' }}>
             Alternate Airport
-            <input 
-              type="text" 
-              placeholder="Search ICAO/Name..."
-              value={margins.alternateSearchQuery}
-              onChange={(e) => handleAlternateSearch(e.target.value)}
-              style={{ width: '100%' }}
-            />
-            {altSearchResults.length > 0 && (
-              <div className="search-dropdown">
-                {altSearchResults.map(res => (
-                  <div key={res.id} className="search-result-item" onClick={() => selectAlternate(res)}>
-                    {res.icao || res.id} - {res.name}
-                  </div>
-                ))}
-              </div>
-            )}
+            <div className="search-container-wrapper">
+              <input 
+                className="search-input"
+                type="text" 
+                placeholder="Search ICAO/Name..."
+                value={margins.alternateSearchQuery}
+                onChange={(e) => handleAlternateSearch(e.target.value)}
+              />
+              {altSearchResults.length > 0 && (
+                <div className="search-dropdown-container">
+                  {altSearchResults.map(res => (
+                    <div key={res.id} className="search-result-item" onClick={() => selectAlternate(res)}>
+                      {res.icao || res.id} - {res.name}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
             {margins.alternateAirport && (
               <button 
                 className="btn-remove-sm" 
@@ -345,7 +351,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
                 Clear Alternate
               </button>
             )}
-          </div >
+          </div>
         </section>
 
         <section className="briefing-section">
@@ -403,7 +409,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
               <div key={i} style={{ 
                 padding: '8px', 
                 borderRadius: '4px', 
-                background: check.isError ? '#fef2f2' : '#f0fdf4',
+                background: check.isError ? '#450a0a' : '#064e3b',
                 border: `1px solid ${check.isError ? '#ef4444' : '#22c55e'}`,
                 fontSize: '14px'
               }}>
@@ -414,7 +420,27 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         </section>
 
         <section className="briefing-section">
-          <h3 className="section-h3">Route & Fuel Projection</h3>
+          <h3 className="section-h3">Destination</h3>
+          {destinationAirport ? (
+            <div className="dest-card">
+              <strong>{destinationAirport.icao || destinationAirport.id}</strong> — {destinationAirport.name}<br/>
+              Runway: {destinationAirport.lengthFeet?.toLocaleString() || 'N/A'} ft ({destinationAirport.surface || 'unknown'})
+            </div>
+          ) : <p>No destination info.</p>}
+        </section>
+
+        {margins.alternateAirport && (
+          <section className="briefing-section">
+            <h3 className="section-h3">Alternate</h3>
+            <div className="dest-card">
+              <strong>{margins.alternateAirport.icao || margins.alternateAirport.id}</strong> — {margins.alternateAirport.name}<br/>
+              Runway: {margins.alternateAirport.lengthFeet?.toLocaleString() || 'N/A'} ft ({margins.alternateAirport.surface || 'unknown'})
+            </div>
+          </section>
+        )}
+
+        <section className="briefing-section">
+          <h3 className="section-h3">Required Fuel Projection</h3>
           <div className="fuel-totals">
             <span>{fuelPlan.totalDist.toFixed(1)} NM</span>
             <span>{formatDuration(fuelPlan.totalHours)}</span>
@@ -428,15 +454,15 @@ export default function MissionBriefing({ missionPlan, onBack }) {
                   <th>Leg</th>
                   <th>MSL</th>
                   <th>Dist</th>
-                  <th>Climb/Desc</th>
+                  <th>Climb/Descent</th>
                   <th>Time</th>
-                  <th>Fuel (C / Cr / D)</th>
+                  <th>Fuel (Climb / Cruise / Descent)</th>
                 </tr>
               </thead>
               <tbody>
                 {fuelPlan.rows.map((leg, index) => (
                   <tr key={leg.id}>
-                    <td>{index + 1}. {leg.start.name} ➡️ {leg.end.name}</td>
+                    <td>{index + 1}. {leg.start.name} ➡️ {leg.end.name} ({leg.end.icao})</td>
                     <td>{Number(leg.selectedMslFeet).toLocaleString()} ft</td>
                     <td>{leg.distNM.toFixed(1)} NM</td>
                     <td className="small-text">+{leg.climbFeet.toLocaleString()}<br/>−{leg.descentFeet.toLocaleString()}</td>
@@ -452,16 +478,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
               </tbody>
             </table>
           </div>
-        </section>
-
-        <section className="briefing-section">
-          <h3 className="section-h3">Destination</h3>
-          {destinationAirport ? (
-            <div className="dest-card">
-              <strong>{destinationAirport.icao || destinationAirport.id}</strong> — {destinationAirport.name}<br/>
-              Runway: {destinationAirport.lengthFeet?.toLocaleString() || 'N/A'} ft ({destinationAirport.surface || 'unknown'})
-            </div>
-          ) : <p>No destination info.</p>}
         </section>
       </main>
     </div>

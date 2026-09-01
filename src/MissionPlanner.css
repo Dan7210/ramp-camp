@@ -1,3 +1,15 @@
+/* Standardized Sidebar Scrolling */
+.mission-planner .sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+.mission-planner .sidebar::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+.mission-planner .sidebar::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+
 .mission-planner .sidebar { gap: 0.85rem; }
 .mission-planner .btn-back, .mission-planner .btn-plan, .mission-planner .btn-plan-sm { border: 1px solid #475569; border-radius: 6px; color: #f8fafc; cursor: pointer; font-weight: 700; }
 .mission-planner .btn-back { padding: 0.7rem; background: #334155; }

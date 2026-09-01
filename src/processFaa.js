@@ -23,11 +23,30 @@ const processData = async () => {
         const siteId = (row['Site Id'] || '').trim();
         const length = parseInt(row['Length'] || '0', 10);
         const surface = (row['Surface Type Condition'] || 'Unknown').trim();
+        
+        // Extract runway orientation (e.g. "09/27" using Base and Reciprocal IDs, or fallback to Runway Id)
+        const baseEnd = (row['Base End Id'] || '').trim();
+        const reciprocalEnd = (row['Reciprocal End Id'] || '').trim();
+        let orientation = (row['Runway Id'] || '').trim();
+        
+        if (baseEnd && reciprocalEnd) {
+          orientation = `${baseEnd}/${reciprocalEnd}`;
+        }
 
         if (siteId) {
           if (!runwaysBySite[siteId]) {
-            runwaysBySite[siteId] = { maxRunwayLength: 0, primarySurface: 'Unknown' };
+            runwaysBySite[siteId] = { 
+              maxRunwayLength: 0, 
+              primarySurface: 'Unknown',
+              orientations: [] 
+            };
           }
+
+          // Collect all unique runway orientations for the airport
+          if (orientation && !runwaysBySite[siteId].orientations.includes(orientation)) {
+            runwaysBySite[siteId].orientations.push(orientation);
+          }
+
           // Track longest runway and its associated surface
           if (length > runwaysBySite[siteId].maxRunwayLength) {
             runwaysBySite[siteId].maxRunwayLength = length;
@@ -51,13 +70,18 @@ const processData = async () => {
         const use = (row['Use'] || '').trim().toUpperCase();
         const lat = parseFloat(row['ARP Latitude DD']);
         const lon = parseFloat(row['ARP Longitude DD']);
+        const elevation = parseFloat(row['Elevation']);
 
         if (facilityType === 'AIRPORT' && !isNaN(lat) && !isNaN(lon)) {
           const siteId = (row['Site Id'] || '').trim();
           const locId = (row['Loc Id'] || '').trim();
           const icaoId = (row['ICAO Id'] || '').trim();
           
-          const runwayData = runwaysBySite[siteId] || { maxRunwayLength: 0, primarySurface: 'Unknown' };
+          const runwayData = runwaysBySite[siteId] || { 
+            maxRunwayLength: 0, 
+            primarySurface: 'Unknown',
+            orientations: []
+          };
 
           airports.push({
             id: locId,
@@ -65,10 +89,12 @@ const processData = async () => {
             name: (row['Name'] || 'Unnamed Airport').trim(),
             lat: lat,
             lon: lon,
+            elevationFeet: !isNaN(elevation) ? elevation : null,
             isPublic: use === 'PU',
             access: use === 'PU' ? 'Public' : 'Private',
             surface: runwayData.primarySurface,
-            lengthFeet: runwayData.maxRunwayLength
+            lengthFeet: runwayData.maxRunwayLength,
+            runwayOrientations: runwayData.orientations
           });
         }
       })

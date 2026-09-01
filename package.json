@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "csv-parser": "^3.2.1",
     "geolib": "^3.3.14",
     "lucide-react": "^1.37.0",
     "magvar": "^2.2.0",
