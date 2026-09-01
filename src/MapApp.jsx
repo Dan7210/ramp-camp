@@ -805,7 +805,14 @@ export default function MapApp() {
         </div>
 
         <div className="origin-card">
-          <span className="label">Origin:</span> {centerCoords[1].toFixed(4)}, {centerCoords[0].toFixed(4)}
+          <span className="label">Origin:</span> {
+            (() => {
+              const nearest = findNearestAirport(centerCoords);
+              return nearest 
+                ? `${nearest.name} (${nearest.icao})` 
+                : `${centerCoords[1].toFixed(4)}, ${centerCoords[0].toFixed(4)}`;
+            })()
+          }
           {isLocked && <span className="locked-badge">[LOCKED]</span>}
         </div>
 

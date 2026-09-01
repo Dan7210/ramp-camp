@@ -4,30 +4,38 @@ const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 
-// Environment & Config Setup
+// -----------------------------------------------------------------------------
+// 1. Environment & Configuration Setup
+// -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 8000;
 const DB_PATH = process.env.DB_PATH || './notams.db';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS 
   ? process.env.ALLOWED_ORIGINS.split(',') 
-  : ['http://localhost:3000'];
+  : ['http://localhost:5173', 'http://localhost:3000'];
 
 const SWIFT_CONFIG = {
   host: process.env.SWIFT_HOST,
-  port: parseInt(process.env.SWIFT_PORT || '5671', 10),
+  port: parseInt(process.env.SWIFT_PORT || '55443', 10),
   username: process.env.SWIFT_USER,
   password: process.env.SWIFT_PASS,
-  queue: process.env.SWIFT_QUEUE,
-  transport: 'tls',
-  reconnect: true
+  vpn: process.env.SWIFT_VPN || 'AIM_FNS',
+  queue: process.env.SWIFT_QUEUE
 };
 
-// Validate critical secrets before booting
-if (!SWIFT_CONFIG.username || !SWIFT_CONFIG.password || !SWIFT_CONFIG.queue) {
-  console.error('[ERROR] Missing required SWIFT credentials in .env file.');
+// Validate required parameters on startup
+if (!SWIFT_CONFIG.host || !SWIFT_CONFIG.username || !SWIFT_CONFIG.password || !SWIFT_CONFIG.queue) {
+  console.error('[FATAL ERROR] Missing required SWIFT configuration in .env file.');
   process.exit(1);
 }
 
-// Database Initialization
+// Ensure Solace queue address prefixing for AMQP 1.0 routing
+const QUEUE_ADDRESS = SWIFT_CONFIG.queue.startsWith('queue://')
+  ? SWIFT_CONFIG.queue
+  : `queue://${SWIFT_CONFIG.queue}`;
+
+// -----------------------------------------------------------------------------
+// 2. Database Initialization (SQLite)
+// -----------------------------------------------------------------------------
 const db = new sqlite3.Database(DB_PATH, (err) => {
   if (err) {
     console.error(`[DB ERROR] Failed to connect to SQLite at ${DB_PATH}:`, err.message);
@@ -41,13 +49,14 @@ db.serialize(() => {
       notam_id TEXT PRIMARY KEY,
       facility TEXT,
       raw_text TEXT,
-      issue_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-      cancellation_flag INTEGER DEFAULT 0
+      issue_time DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 });
 
-// AMQP Ingestion Engine
+// -----------------------------------------------------------------------------
+// 3. AIXM Parsing Helper
+// -----------------------------------------------------------------------------
 function parseAixmNotam(xmlString) {
   const idMatch = xmlString.match(/<aixm:id>(.*?)<\/aixm:id>/) || xmlString.match(/<id>(.*?)<\/id>/);
   const facilityMatch = xmlString.match(/<aixm:location>(.*?)<\/aixm:location>/) || xmlString.match(/<location>(.*?)<\/location>/);
@@ -60,9 +69,53 @@ function parseAixmNotam(xmlString) {
   };
 }
 
+// -----------------------------------------------------------------------------
+// 4. AMQP Ingestion Engine (rhea + FAA Solace Broker)
+// -----------------------------------------------------------------------------
+container.on('error', (err) => {
+  console.error('[AMQP CONTAINER ERROR]', err.message || err);
+});
+
+container.on('connection_open', () => {
+  console.log('[SWIFT] Successfully connected and session opened with FAA Solace Broker.');
+});
+
+container.on('connection_close', (context) => {
+  const error = context.connection.error;
+  if (error) {
+    console.warn(`[SWIFT DISCONNECTED] Broker closed connection: ${error.condition} - ${error.description}`);
+  } else {
+    console.warn('[SWIFT DISCONNECTED] Connection closed. Reconnecting...');
+  }
+});
+
+container.on('disconnected', (context) => {
+  const error = context.connection.error;
+  console.warn('[SWIFT DISCONNECTED] Transport layer dropped connection.', error ? error.message : '');
+});
+
 container.on('message', (context) => {
-  const payload = context.message.body ? context.message.body.toString() : '';
-  const parsed = parseAixmNotam(payload);
+  let rawXml = '';
+  const body = context.message.body;
+
+  // Handle varying Solace AMQP message body encodings
+  if (typeof body === 'string') {
+    rawXml = body;
+  } else if (Buffer.isBuffer(body)) {
+    rawXml = body.toString('utf-8');
+  } else if (body && body.content) {
+    rawXml = Buffer.isBuffer(body.content) 
+      ? body.content.toString('utf-8') 
+      : String(body.content);
+  } else if (Array.isArray(body)) {
+    rawXml = Buffer.concat(body).toString('utf-8');
+  } else {
+    rawXml = JSON.stringify(body);
+  }
+
+  console.log(`[RAW RECEIVED] Length: ${rawXml.length} bytes | Preview: ${rawXml.substring(0, 100).replace(/\r?\n|\r/g, '')}...`);
+
+  const parsed = parseAixmNotam(rawXml);
 
   const query = `
     INSERT INTO notams (notam_id, facility, raw_text, issue_time)
@@ -75,31 +128,46 @@ container.on('message', (context) => {
 
   db.run(query, [parsed.notamId, parsed.facility, parsed.rawText], (err) => {
     if (err) {
-      console.error('[INGEST ERROR] Failed to store NOTAM:', err.message);
+      console.error('[DB INSERT ERROR]', err.message);
     } else {
       console.log(`[INGESTED] ID: ${parsed.notamId} | Facility: ${parsed.facility}`);
     }
   });
 });
 
-container.on('error', (err) => {
-  console.error('[AMQP ERROR] Connection error:', err);
-});
-
-// Start AMQP Listener
+// Establish Solace Connection
 const connection = container.connect({
   host: SWIFT_CONFIG.host,
   port: SWIFT_CONFIG.port,
-  transport: SWIFT_CONFIG.transport,
+  transport: 'tls',
   username: SWIFT_CONFIG.username,
   password: SWIFT_CONFIG.password,
-  reconnect: SWIFT_CONFIG.reconnect
+  hostname: SWIFT_CONFIG.vpn,
+  properties: {
+    'tenant-id': SWIFT_CONFIG.vpn
+  },
+  reconnect: true,
+  reconnect_limit: 100,
+  initial_reconnect_delay: 2000,
+  max_reconnect_delay: 30000
 });
 
-connection.open_receiver(SWIFT_CONFIG.queue);
-console.log(`[SWIFT] Listener connected to ${SWIFT_CONFIG.host}:${SWIFT_CONFIG.port} (Queue: ${SWIFT_CONFIG.queue})`);
+// Open Receiver with explicit credit replenishment and auto-acknowledgment
+connection.open_receiver({
+  source: {
+    address: QUEUE_ADDRESS,
+    durable: 2,
+    expiry_policy: 'never'
+  },
+  credit_window: 10,
+  autoaccept: true
+});
 
-//EXPRESS REST API Server
+console.log(`[SWIFT] Receiver initializing for ${QUEUE_ADDRESS} on ${SWIFT_CONFIG.host}:${SWIFT_CONFIG.port} (VPN: ${SWIFT_CONFIG.vpn})`);
+
+// -----------------------------------------------------------------------------
+// 5. Express REST API Server
+// -----------------------------------------------------------------------------
 const app = express();
 
 app.use(cors({
@@ -137,5 +205,5 @@ app.get('/api/notams', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[REST API] Server running on port ${PORT}`);
+  console.log(`[REST API] Express server running on port ${PORT}`);
 });

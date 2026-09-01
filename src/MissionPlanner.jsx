@@ -95,8 +95,27 @@ const createInitialWaypoints = (missionData) => {
   const airport = extractCoords(missionData?.airport);
   if (!origin || !airport) return [];
 
+  let originName = 'Origin Marker';
+  let originIcao = '';
+  let minDistance = 30; // Search for origin airport within 30NM
+
+  faaAirports.forEach((apt) => {
+    const dist = calculateNM(origin, { lat: apt.lat, lon: apt.lon });
+    if (dist < minDistance) {
+      minDistance = dist;
+      originName = apt.name;
+      originIcao = apt.icao;
+    }
+  });
+
   return [
-    { id: 'origin_wp', name: 'Origin Marker', type: 'origin', ...origin },
+    { 
+      id: 'origin_wp', 
+      name: originIcao ? `${originName} (${originIcao})` : originName, 
+      type: 'origin', 
+      icao: '',
+      ...origin 
+    },
     {
       id: `apt_${missionData.airport.icao || missionData.airport.id || 'dest'}`,
       name: missionData.airport.name || 'Destination Airport',
