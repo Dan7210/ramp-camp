@@ -186,10 +186,8 @@ html, body {
 }
 
 .sidebar-section.matches-section {
-  flex: 1;
   display: flex;
   flex-direction: column;
-  min-height: 0;
 }
 
 /* Legend items */
@@ -363,8 +361,6 @@ html, body {
 }
 
 .interactive-list {
-  flex: 1;
-  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
