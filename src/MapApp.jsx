@@ -29,6 +29,7 @@ export default function MapApp() {
   const overlayRef = useRef(null);
   const vectorSourceRef = useRef(new VectorSource());
   const abortControllerRef = useRef(null);
+  const dropdownRef = useRef(null);
 
   // Layer references for dynamic layer toggling
   const osmLayerRef = useRef(null);
@@ -62,6 +63,9 @@ export default function MapApp() {
   // Map Layer Selection state
   const [activeBaseLayer, setActiveBaseLayer] = useState('osm');
 
+  // Custom Dropdown state
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+
   // Lazy initialize state from localStorage
   const [savedStates, setSavedStates] = useState(() => {
     try {
@@ -74,9 +78,16 @@ export default function MapApp() {
 
   const [selectedSaveKey, setSelectedSaveKey] = useState('');
 
-  // ---------------------------------------------------------------------------
-  // HELPER & RENDER FUNCTIONS (Declared before useEffect to avoid TDZ errors)
-  // ---------------------------------------------------------------------------
+  // Close custom dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setIsDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const updateOriginMarker = (coords) => {
     const features = vectorSourceRef.current.getFeatures();
@@ -199,9 +210,16 @@ export default function MapApp() {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
-  // ---------------------------------------------------------------------------
-  // MAP EFFECT
-  // ---------------------------------------------------------------------------
+  // Fingerprint for matching duplicate parameter entries
+  const getQueryDataKey = (state) => JSON.stringify({
+    coords: state.centerCoords,
+    aRad: state.airportRadiusMiles,
+    cRad: state.campRadiusMiles,
+    surf: state.surfaceFilter,
+    access: state.accessFilter,
+    minRun: state.minRunwayLength,
+    cached: state.cachedData
+  });
 
   useEffect(() => {
     if (currentView !== 'map') return;
@@ -216,7 +234,7 @@ export default function MapApp() {
       source: new XYZ({
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         maxZoom: 19,
-        attributions: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+        attributions: 'Tiles &copy; Esri'
       }),
       visible: false
     });
@@ -226,7 +244,7 @@ export default function MapApp() {
       source: new XYZ({
         url: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}?cacheKey=80de4464e4be2193',
         maxZoom: 14,
-        attributions: 'Federal Aviation Administration, Aeronautical Information Services'
+        attributions: 'FAA'
       }),
       visible: false
     });
@@ -377,10 +395,6 @@ export default function MapApp() {
     return () => initialMap.setTarget(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentView]);
-
-  // ---------------------------------------------------------------------------
-  // HANDLERS
-  // ---------------------------------------------------------------------------
 
   const handleBaseLayerChange = (layerType) => {
     setActiveBaseLayer(layerType);
@@ -584,18 +598,17 @@ export default function MapApp() {
   };
 
   const handleSaveState = () => {
-    const uniqueId = `query_${crypto.randomUUID()}`;
     const nearestApt = findNearestAirport(centerCoords);
     const aptIdentifier = nearestApt 
       ? `${nearestApt.icao || nearestApt.id || 'N/A'}`
       : `${centerCoords[1].toFixed(3)}, ${centerCoords[0].toFixed(3)}`;
     
-    const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const displayLabel = `Near ${aptIdentifier} - ${timeString}`;
+    const dateObj = new Date();
+    const dateString = dateObj.toLocaleDateString();
+    const timeString = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const displayLabel = `Near ${aptIdentifier} - ${dateString} ${timeString}`;
     
-    const stateToSave = {
-      id: uniqueId,
-      label: displayLabel,
+    const candidateState = {
       centerCoords,
       airportRadiusMiles,
       campRadiusMiles,
@@ -608,11 +621,43 @@ export default function MapApp() {
       isLocked
     };
 
-    const updatedMap = { ...savedStates, [uniqueId]: stateToSave };
+    const newKey = getQueryDataKey(candidateState);
+
+    // Overwrite duplicate parameter entry
+    let targetId = `query_${crypto.randomUUID()}`;
+    for (const [id, saved] of Object.entries(savedStates)) {
+      if (getQueryDataKey(saved) === newKey) {
+        targetId = id;
+        break;
+      }
+    }
+
+    const stateToSave = {
+      ...candidateState,
+      id: targetId,
+      label: displayLabel,
+      saveDate: dateObj.toISOString()
+    };
+
+    const updatedMap = { ...savedStates, [targetId]: stateToSave };
     setSavedStates(updatedMap);
-    setSelectedSaveKey(uniqueId);
+    setSelectedSaveKey(targetId);
     localStorage.setItem(MULTI_STORAGE_KEY, JSON.stringify(updatedMap));
     setStatusLog(`Saved query: ${displayLabel}`);
+  };
+
+  const handleDeleteSavedState = (idToDelete, e) => {
+    if (e) e.stopPropagation();
+    
+    const updatedMap = { ...savedStates };
+    delete updatedMap[idToDelete];
+
+    setSavedStates(updatedMap);
+    localStorage.setItem(MULTI_STORAGE_KEY, JSON.stringify(updatedMap));
+
+    if (selectedSaveKey === idToDelete) {
+      setSelectedSaveKey('');
+    }
   };
 
   const handleLoadState = () => {
@@ -711,7 +756,6 @@ export default function MapApp() {
     URL.revokeObjectURL(url);
   };
 
-  // Fixed payload format to provide both array & object formats for origin coordinates
   const handleSelectMission = (airport, camp, route) => {
     const nearestOriginApt = findNearestAirport(centerCoords);
 
@@ -780,7 +824,6 @@ export default function MapApp() {
 
   const savedKeysList = Object.keys(savedStates);
 
-  // Render Mission Planner view if triggered
   if (currentView === 'planner' && selectedMission) {
     return (
       <MissionPlanner 
@@ -885,21 +928,89 @@ export default function MapApp() {
           <button onClick={handleSaveState} disabled={loading || !cachedData} className="btn-save">
             Save Current Query
           </button>
-          
-          <div className="load-select-wrapper">
-            <select 
-              value={selectedSaveKey} 
-              onChange={(e) => setSelectedSaveKey(e.target.value)}
-              className="select-saved"
-              disabled={savedKeysList.length === 0 || loading}
-            >
-              <option value="">Select Saved Query...</option>
-              {savedKeysList.map((key) => (
-                <option key={key} value={key}>
-                  {savedStates[key].label}
-                </option>
-              ))}
-            </select>
+
+          <div className="load-select-wrapper" style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+            {/* Custom Dropdown Container */}
+            <div ref={dropdownRef} style={{ position: 'relative', flex: 1 }}>
+              <div 
+                onClick={() => !loading && savedKeysList.length > 0 && setIsDropdownOpen(!isDropdownOpen)}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '8px 12px',
+                  backgroundColor: '#1e293b',
+                  color: selectedSaveKey && savedStates[selectedSaveKey] ? '#f8fafc' : '#94a3b8',
+                  border: '1px solid #334155',
+                  borderRadius: '6px',
+                  fontSize: '13px',
+                  cursor: savedKeysList.length === 0 || loading ? 'not-allowed' : 'pointer',
+                  opacity: savedKeysList.length === 0 || loading ? 0.6 : 1,
+                  userSelect: 'none',
+                  boxSizing: 'border-box'
+                }}
+              >
+                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {selectedSaveKey && savedStates[selectedSaveKey] 
+                    ? savedStates[selectedSaveKey].label 
+                    : 'Select Saved Query...'}
+                </span>
+                <span style={{ fontSize: '10px', marginLeft: '6px', color: '#94a3b8' }}>▼</span>
+              </div>
+
+              {/* Custom Dropdown Menu Options */}
+              {isDropdownOpen && savedKeysList.length > 0 && (
+                <div style={{
+                  position: 'absolute',
+                  top: '100%',
+                  left: 0,
+                  right: 0,
+                  maxHeight: '160px',
+                  overflowY: 'auto',
+                  backgroundColor: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: '6px',
+                  zIndex: 1000,
+                  marginTop: '4px',
+                  boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.5)'
+                }}>
+                  {savedKeysList.map((key) => (
+                    <div 
+                      key={key} 
+                      onClick={() => {
+                        setSelectedSaveKey(key);
+                        setIsDropdownOpen(false);
+                      }}
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        padding: '6px 10px',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                        color: '#f8fafc',
+                        backgroundColor: selectedSaveKey === key ? '#1e293b' : 'transparent'
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#1e293b'}
+                      onMouseLeave={(e) => e.currentTarget.style.backgroundColor = selectedSaveKey === key ? '#1e293b' : 'transparent'}
+                    >
+                      <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginRight: '6px' }}>
+                        {savedStates[key].label}
+                      </span>
+                      <button 
+                        onClick={(e) => handleDeleteSavedState(key, e)} 
+                        className="btn-remove-sm" 
+                        title="Delete Saved Query"
+                        style={{ padding: '0 4px', lineHeight: '12px', fontSize: '11px' }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <button 
               onClick={handleLoadState} 
               disabled={!selectedSaveKey || loading} 
