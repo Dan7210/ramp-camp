@@ -2,8 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { XMLParser } = require('fast-xml-parser');
+const https = require('https');
+const fs = require('fs');
+const cors = require('cors');
 
 const app = express();
+
+// Enable CORS and JSON body parsing
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -137,7 +143,6 @@ async function processQueue() {
     const cacheKey = getCacheKey(params);
     const now = Date.now();
 
-    // Secondary check: if another queued task resolved this key while waiting
     if (notamCache.has(cacheKey)) {
       const cached = notamCache.get(cacheKey);
       if (now - cached.timestamp < CACHE_TTL_MS) {
@@ -150,7 +155,6 @@ async function processQueue() {
       console.log(`[QUEUE WORKER] Fetching live FAA data for key: ${cacheKey}`);
       const xmlData = await executeFaaApiCall(params);
       
-      // Store in memory cache with timestamp
       notamCache.set(cacheKey, { timestamp: now, data: xmlData });
       
       resolve(xmlData);
@@ -158,7 +162,6 @@ async function processQueue() {
       reject(err);
     }
 
-    // Rate-limit delay before processing the next item in queue
     if (globalRequestQueue.length > 0) {
       await delay(API_DELAY_MS);
     }
@@ -352,6 +355,12 @@ app.post('/api/notams/route', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`FAA NMS NOTAM Service with Cache & Queue running on port ${PORT}`);
+// Load SSL certificates and create HTTPS server
+const sslOptions = {
+  key: fs.readFileSync('/etc/letsencrypt/live/adsb-radar.duckdns.org/privkey.pem'),
+  cert: fs.readFileSync('/etc/letsencrypt/live/adsb-radar.duckdns.org/fullchain.pem')
+};
+
+https.createServer(sslOptions, app).listen(PORT, '0.0.0.0', () => {
+  console.log(`Secure FAA NMS NOTAM Service running at https://adsb-radar.duckdns.org:${PORT}/api/notams/route`);
 });
