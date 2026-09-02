@@ -13,28 +13,19 @@ import Overlay from 'ol/Overlay';
 import { fromLonLat } from 'ol/proj';
 import { Style, Circle as CircleStyle, Fill, Stroke } from 'ol/style';
 
-// Helper function to parse ICAO format (e.g., "3526N08232W" or "333831N0842606W")
 function parseIcaoCoordinates(coordStr) {
   if (typeof coordStr !== 'string') return null;
-
-  // Matches DDMM[SS]N/S and DDDMM[SS]E/W
   const match = coordStr.match(/^(\d{2,6})([NS])(\d{3,7})([EW])$/i);
   if (!match) return null;
 
   const [, latStr, latDir, lonStr, lonDir] = match;
 
   const parseDMS = (str) => {
-    if (str.length === 2 || str.length === 3) return parseFloat(str); // Degrees only
+    if (str.length === 2 || str.length === 3) return parseFloat(str);
     if (str.length === 4 || str.length === 5) {
-      const deg = parseFloat(str.slice(0, -2));
-      const min = parseFloat(str.slice(-2));
-      return deg + min / 60;
+      return parseFloat(str.slice(0, -2)) + parseFloat(str.slice(-2)) / 60;
     }
-    // Degrees, Minutes, Seconds
-    const deg = parseFloat(str.slice(0, -4));
-    const min = parseFloat(str.slice(-4, -2));
-    const sec = parseFloat(str.slice(-2));
-    return deg + min / 60 + sec / 360;
+    return parseFloat(str.slice(0, -4)) + parseFloat(str.slice(-4, -2)) / 60 + parseFloat(str.slice(-2)) / 3600;
   };
 
   let lat = parseDMS(latStr);
@@ -46,18 +37,32 @@ function parseIcaoCoordinates(coordStr) {
   return { lat, lon };
 }
 
-export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
+export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) {
   const mapElement = useRef(null);
   const tooltipElement = useRef(null);
   const mapRef = useRef(null);
   const vectorSourceRef = useRef(new VectorSource());
   const overlayRef = useRef(null);
+  
+  // Refs to avoid map re-creation when callbacks or hover props change
+  const hoveredNotamIdRef = useRef(hoveredNotamId);
+  const onHoverNotamRef = useRef(onHoverNotam);
+  const lastPlottedKeyRef = useRef('');
 
+  useEffect(() => {
+    hoveredNotamIdRef.current = hoveredNotamId;
+  }, [hoveredNotamId]);
+
+  useEffect(() => {
+    onHoverNotamRef.current = onHoverNotam;
+  }, [onHoverNotam]);
+
+  // Map Setup Effect - Runs ONLY ONCE on mount
   useEffect(() => {
     const vectorLayer = new VectorLayer({
       source: vectorSourceRef.current,
       style: (feature) => {
-        const isHovered = feature.get('id') === hoveredNotamId;
+        const isHovered = feature.get('id') === hoveredNotamIdRef.current;
         const level = feature.get('level') || 'low';
 
         let color = '#475569';
@@ -115,11 +120,15 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
       const feature = initialMap.forEachFeatureAtPixel(evt.pixel, (f) => f);
       if (feature) {
         const coordinates = evt.coordinate;
-        onHoverNotam(feature.get('id'));
+        if (onHoverNotamRef.current) {
+          onHoverNotamRef.current(feature.get('id'));
+        }
         overlay.setPosition(coordinates);
         if (mapElement.current) mapElement.current.style.cursor = 'pointer';
       } else {
-        onHoverNotam(null);
+        if (onHoverNotamRef.current) {
+          onHoverNotamRef.current(null);
+        }
         overlay.setPosition(undefined);
         if (mapElement.current) mapElement.current.style.cursor = '';
       }
@@ -127,11 +136,19 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
 
     mapRef.current = initialMap;
 
-    return () => initialMap.setTarget(null);
-  }, [hoveredNotamId, onHoverNotam]);
+    return () => {
+      initialMap.setTarget(null);
+    };
+  }, []); // Run ONCE on mount
 
+  // Vector Feature Data Update Effect
   useEffect(() => {
     if (!mapRef.current) return;
+
+    // Guard against re-fitting if NOTAM set hasn't changed
+    const currentKey = notams.map((n) => n.id || n.text).join('|');
+    if (currentKey === lastPlottedKeyRef.current) return;
+    lastPlottedKeyRef.current = currentKey;
 
     vectorSourceRef.current.clear();
     const validCoords = [];
@@ -140,26 +157,20 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
       let lat = null;
       let lon = null;
 
-      // 1. Try parsing ICAO string (e.g., "3526N08232W")
       if (typeof notam.coordinates === 'string') {
         const parsed = parseIcaoCoordinates(notam.coordinates);
         if (parsed) {
           lat = parsed.lat;
           lon = parsed.lon;
         }
-      } 
-      // 2. Try array format [lon, lat] or [lat, lon]
-      else if (Array.isArray(notam.coordinates) && notam.coordinates.length >= 2) {
+      } else if (Array.isArray(notam.coordinates) && notam.coordinates.length >= 2) {
         lat = Number(notam.coordinates[1]);
         lon = Number(notam.coordinates[0]);
-      } 
-      // 3. Try object properties
-      else if (notam.lat && notam.lng) {
+      } else if (notam.lat && notam.lng) {
         lat = Number(notam.lat);
         lon = Number(notam.lng);
       }
 
-      // Ensure lat/lon aren't inverted (US Lat ~24-50, Lon ~ -125 to -66)
       if (lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon)) {
         const finalLat = Math.abs(lat) > 90 ? lon : lat;
         const finalLon = Math.abs(lat) > 90 ? lat : lon;
@@ -170,15 +181,15 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
         const radiusMiles = notam.radiusNM || notam.radiusMiles || 0;
 
         if (radiusMiles > 0) {
-          // Convert Nautical Miles to Meters for map rendering (1 NM = 1852 meters)
           const radiusMeters = radiusMiles * 1852;
           const circleGeom = circularPolygon([finalLon, finalLat], radiusMeters, 64)
             .transform('EPSG:4326', mapRef.current.getView().getProjection());
+
           const circleFeature = new Feature({
             geometry: circleGeom,
             id: notam.id,
             text: notam.text,
-            level: notam.classification
+            level: notam.classification || notam.level
           });
           vectorSourceRef.current.addFeature(circleFeature);
         } else {
@@ -186,7 +197,7 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
             geometry: new Point(centerCoords),
             id: notam.id,
             text: notam.text,
-            level: notam.classification
+            level: notam.classification || notam.level
           });
           vectorSourceRef.current.addFeature(pointFeature);
         }
@@ -199,8 +210,11 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
     }
   }, [notams]);
 
+  // Re-render layer style smoothly on hover state changes
   useEffect(() => {
-    vectorSourceRef.current.changed();
+    if (vectorSourceRef.current) {
+      vectorSourceRef.current.changed();
+    }
   }, [hoveredNotamId]);
 
   const activeNotam = notams.find((n) => n.id === hoveredNotamId);

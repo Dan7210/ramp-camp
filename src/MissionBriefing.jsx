@@ -342,6 +342,8 @@ export default function MissionBriefing({ missionPlan, onBack }) {
   const activeGasMargin = useMemo(() => {
     if (isMarginManual) return toNumber(margins.gasMarginMinutes);
     const startTime = new Date(etd);
+    if (isNaN(startTime.getTime())) return 30;
+
     const totalFlightHours = missionPlan.legs.reduce((acc, leg) => acc + (leg.distNM / (performance.cruiseKt || 100)), 0);
     const endTime = new Date(startTime.getTime() + totalFlightHours * 3600000);
     return (isDaytime(startTime) && isDaytime(endTime)) ? 30 : 45;
@@ -659,7 +661,13 @@ export default function MissionBriefing({ missionPlan, onBack }) {
       <main className="nwkraft-content">
         <header>
           <h1>NWKRAFT Mission Briefing</h1>
-          <p>ETD Target UTC: {new Date(etd).toISOString().replace('.000', '')} | NOTAM Review: {notamsReviewed ? 'Reviewed' : 'Pending'}</p>
+          <p>
+            ETD Target UTC: {
+              !isNaN(new Date(etd).getTime()) 
+                ? new Date(etd).toISOString().replace('.000', '') 
+                : 'Invalid Date'
+            } | NOTAM Review: {notamsReviewed ? 'Reviewed' : 'Pending'}
+          </p>
         </header>
 
         <section className="briefing-section notam-section">
