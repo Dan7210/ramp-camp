@@ -21,6 +21,77 @@ const getBearerToken = () => {
 
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSIgnore: false }), deepFind = (obj, k) => { if (!obj || typeof obj !== 'object') return null; if (k in obj) return obj[k]; for (const key in obj) { const r = deepFind(obj[key], k); if (r) return r; } return null; }, firstNumber = v => { if (!v) return null; const m = String(v).match(/-?\d+(?:\.\d+)?/g); return m ? Number(m[0]) : null; };
 
+// Drop and re-create airports table to cleanly capture codes from CSV
+db.exec(`
+  DROP TABLE IF EXISTS airports;
+  CREATE TABLE airports (
+    icao TEXT PRIMARY KEY,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_airports_icao ON airports(icao);
+`);
+
+// Load and parse airports.csv
+try {
+  const airportFilePath = path.join(__dirname, 'data', 'airports.csv');
+  if (fs.existsSync(airportFilePath)) {
+    const fileContent = fs.readFileSync(airportFilePath, 'utf8');
+    const lines = fileContent.split(/\r?\n/);
+    
+    if (lines.length > 0) {
+      // Simple CSV line tokenizer handling quoted fields
+      const parseCSVLine = (line) => {
+        const res = [];
+        let cur = '', inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const c = line[i];
+          if (c === '"') { inQuotes = !inQuotes; }
+          else if (c === ',' && !inQuotes) { res.push(cur.trim()); cur = ''; }
+          else { cur += c; }
+        }
+        res.push(cur.trim());
+        return res.map(v => v.replace(/^"|"$/g, ''));
+      };
+
+      const headers = parseCSVLine(lines[0]);
+      const locIdIdx = headers.indexOf('Loc Id');
+      const icaoIdx = headers.indexOf('ICAO Id');
+      const latIdx = headers.indexOf('ARP Latitude DD');
+      const lonIdx = headers.indexOf('ARP Longitude DD');
+
+      if (latIdx !== -1 && lonIdx !== -1) {
+        const insertAirport = db.prepare('INSERT OR IGNORE INTO airports (icao, lat, lon) VALUES (?, ?, ?)');
+        const insertMany = db.transaction((rows) => {
+          for (let i = 1; i < rows.length; i++) {
+            if (!rows[i]) continue;
+            const cols = parseCSVLine(rows[i]);
+            const lat = Number(cols[latIdx]);
+            const lon = Number(cols[lonIdx]);
+
+            if (Number.isFinite(lat) && Number.isFinite(lon)) {
+              if (locIdIdx !== -1 && cols[locIdIdx]) {
+                insertAirport.run(cols[locIdIdx].trim().toUpperCase(), lat, lon);
+              }
+              if (icaoIdx !== -1 && cols[icaoIdx]) {
+                insertAirport.run(cols[icaoIdx].trim().toUpperCase(), lat, lon);
+              }
+            }
+          }
+        });
+        insertMany(lines);
+        console.log(`[INIT] Loaded airport coordinates from airports.csv into database.`);
+      } else {
+        console.warn('[INIT] Could not find required lat/lon columns in airports.csv headers.');
+      }
+    }
+  }
+} catch (err) {
+  console.warn('[INIT] Could not load airports.csv:', err.message);
+}
+
+const getAirportCoords = db.prepare('SELECT lat, lon FROM airports WHERE icao = ?');
+
 const extractCoordinates = (mObj, rawText = '') => {
   // 1. Capture AIXM Polygons (gml:posList)
   const posList = deepFind(mObj, 'gml:posList') || deepFind(mObj, 'posList');
@@ -87,8 +158,39 @@ const normalizeAixmNotam = pXml => {
     const ev = deepFind(pXml, 'event:Event') || pXml, txt = deepFind(ev, 'event:textNOTAM'), ext = deepFind(ev, 'fnse:EventExtension'), vt = deepFind(ev, 'gml:validTime') || deepFind(ev, 'validTime');
     let rt = deepFind(txt, 'event:text') || '';
     if (!rt) { const tr = [].concat(deepFind(txt, 'event:translation') || []); const ic = tr.find(t => deepFind(t, 'event:type') === 'OTHER:ICAO'); rt = deepFind(ic, '#text') || deepFind(ic, 'event:formattedText') || ''; }
-    const ser = deepFind(txt, 'event:series') || '', num = deepFind(txt, 'event:number') || '', yr = deepFind(txt, 'event:year') ? String(deepFind(txt, 'event:year')).slice(-2) : '', nms = deepFind(ev, 'event:nmsId') || deepFind(ev, 'event:id') || ev['@_gml:id'] || null, pt = extractCoordinates(ev, rt);
-    return { id: ser && num ? `${ser}${String(num).padStart(4, '0')}/${yr}` : String(nms || ''), nmsId: nms ? String(nms) : null, facility: deepFind(ext, 'fnse:icaoLocation') || deepFind(txt, 'event:location') || 'UNKNOWN', airportName: deepFind(ext, 'fnse:airportname') || '', type: deepFind(txt, 'event:type') || 'N', effectiveStart: deepFind(vt, 'gml:beginPosition') || deepFind(vt, 'beginPosition') || null, effectiveEnd: deepFind(vt, 'gml:endPosition') || deepFind(vt, 'endPosition') || null, coordinates: pt?.polygon ? JSON.stringify(pt.polygon) : null, latitude: pt?.latitude ?? null, longitude: pt?.longitude ?? null, radiusNM: firstNumber(deepFind(txt, 'event:radius')), text: String(rt).replace(/<pre>|<\/pre>/gi, '').trim(), classification: deepFind(ext, 'fnse:classification') || 'CIVIL', raw: pXml };
+    
+    const ser = deepFind(txt, 'event:series') || '', num = deepFind(txt, 'event:number') || '', yr = deepFind(txt, 'event:year') ? String(deepFind(txt, 'event:year')).slice(-2) : '', nms = deepFind(ev, 'event:nmsId') || deepFind(ev, 'event:id') || ev['@_gml:id'] || null;
+    
+    let facility = deepFind(ext, 'fnse:icaoLocation') || deepFind(txt, 'event:location') || 'UNKNOWN';
+    facility = String(facility).trim().toUpperCase();
+
+    // Extract coordinates via XML / text regex first
+    let pt = extractCoordinates(ev, rt);
+
+    // Fallback: If no coordinates found, check airport database using facility code
+    if (!pt && facility && facility !== 'UNKNOWN') {
+      const apMatch = getAirportCoords.get(facility);
+      if (apMatch) {
+        pt = { latitude: apMatch.lat, longitude: apMatch.lon, polygon: null };
+      }
+    }
+
+    return { 
+      id: ser && num ? `${ser}${String(num).padStart(4, '0')}/${yr}` : String(nms || ''), 
+      nmsId: nms ? String(nms) : null, 
+      facility: facility, 
+      airportName: deepFind(ext, 'fnse:airportname') || '', 
+      type: deepFind(txt, 'event:type') || 'N', 
+      effectiveStart: deepFind(vt, 'gml:beginPosition') || deepFind(vt, 'beginPosition') || null, 
+      effectiveEnd: deepFind(vt, 'gml:endPosition') || deepFind(vt, 'endPosition') || null, 
+      coordinates: pt?.polygon ? JSON.stringify(pt.polygon) : null, 
+      latitude: pt?.latitude ?? null, 
+      longitude: pt?.longitude ?? null, 
+      radiusNM: firstNumber(deepFind(txt, 'event:radius')), 
+      text: String(rt).replace(/<pre>|<\/pre>/gi, '').trim(), 
+      classification: deepFind(ext, 'fnse:classification') || 'CIVIL', 
+      raw: pXml 
+    };
   } catch { return { id: null, raw: pXml }; }
 };
 
