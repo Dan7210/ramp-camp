@@ -27,3 +27,7 @@ dist-ssr
 !.env.example
 
 faa-guide/
+
+*.db
+*.db-shm
+*.db-wal

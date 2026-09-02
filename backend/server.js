@@ -1,366 +1,123 @@
 require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const { XMLParser } = require('fast-xml-parser');
-const https = require('https');
-const fs = require('fs');
-const cors = require('cors');
+const express = require('express'), axios = require('axios'), Database = require('better-sqlite3'), { XMLParser } = require('fast-xml-parser'), cors = require('cors'), fs = require('fs'), path = require('path'), os = require('os'), zlib = require('zlib'), { promisify } = require('util'), { execFile } = require('child_process');
+const gunzip = promisify(zlib.gunzip), execFileAsync = promisify(execFile), app = express();
+app.use(cors()); app.use(express.json({ limit: '2mb' }));
 
-const app = express();
+const { PORT = 3000, NMS_CLIENT_ID, NMS_CLIENT_SECRET, NMS_BASE_URL = 'https://api-staging.cgifederal-aim.com', NOTAM_DB_PATH = path.join(__dirname, 'data', 'notams.db'), NOTAM_SYNC_INTERVAL_MS = 180000, NOTAM_INITIAL_LOAD_STALE_MS = 21600000, NOTAM_DELTA_LOOKBACK_MS = 300000, DUCKDNS_HOST = 'adsb-radar.duckdns.org', SERVER_PROTOCOL = 'AUTO' } = process.env;
+const BASE_URL = NMS_BASE_URL, HTTPS_KEY = process.env.HTTPS_KEY || `/etc/letsencrypt/live/${DUCKDNS_HOST}/privkey.pem`, HTTPS_CERT = process.env.HTTPS_CERT || `/etc/letsencrypt/live/${DUCKDNS_HOST}/fullchain.pem`;
 
-// Enable CORS and JSON body parsing
-app.use(cors());
-app.use(express.json());
+if (!NMS_CLIENT_ID || !NMS_CLIENT_SECRET) console.warn('[CONFIG] NMS_CLIENT_ID / NMS_CLIENT_SECRET are not set.');
+fs.mkdirSync(path.dirname(NOTAM_DB_PATH), { recursive: true });
+const db = new Database(NOTAM_DB_PATH);
+db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS notams (id TEXT PRIMARY KEY, nms_id TEXT, facility TEXT, airport_name TEXT, type TEXT, classification TEXT, effective_start TEXT, effective_end TEXT, latitude REAL, longitude REAL, radius_nm REAL, coordinates TEXT, text TEXT, raw_json TEXT, updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_notams_facility ON notams(facility); CREATE INDEX IF NOT EXISTS idx_notams_effective_end ON notams(effective_end); CREATE INDEX IF NOT EXISTS idx_notams_lat_lon ON notams(latitude, longitude); CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 
-const PORT = process.env.PORT || 3000;
-const CLIENT_ID = process.env.NMS_CLIENT_ID;
-const CLIENT_SECRET = process.env.NMS_CLIENT_SECRET;
-const BASE_URL = process.env.NMS_BASE_URL || 'https://api-staging.cgifederal-aim.com';
-
-const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minute cache TTL
-const API_DELAY_MS = 1050;          // Enforce > 1 second between raw FAA calls
-
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: '@_',
-  removeNSIgnore: false
-});
-
-let cachedToken = null;
-let tokenExpirationTime = 0;
-let tokenPromise = null;
-
-// Storage structures for caching and global queueing
-const notamCache = new Map();
-const globalRequestQueue = [];
-let isProcessingQueue = false;
-
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/**
- * Great Circle distance calculation (Nautical Miles)
- */
-function calculateDistanceNM(lat1, lon1, lat2, lon2) {
-  const R = 3440.065;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-            Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-/**
- * Manages Bearer Token generation and reuse
- */
-async function getBearerToken() {
-  const now = Date.now();
-  if (cachedToken && now < tokenExpirationTime - 30000) {
-    return cachedToken;
-  }
-
+const getState = k => db.prepare('SELECT value FROM sync_state WHERE key = ?').get(k)?.value || null, setState = (k, v) => db.prepare('INSERT INTO sync_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, String(v));
+let cachedToken = null, tokenExpirationTime = 0, tokenPromise = null;
+const getBearerToken = () => {
+  if (cachedToken && Date.now() < tokenExpirationTime - 30000) return cachedToken;
   if (tokenPromise) return tokenPromise;
-
-  const authUrl = `${BASE_URL}/v1/auth/token`;
-  const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
-
-  tokenPromise = (async () => {
-    try {
-      console.log(`[AUTH] Requesting Bearer Token...`);
-      const response = await axios.post(
-        authUrl,
-        'grant_type=client_credentials',
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': `Basic ${credentials}`
-          }
-        }
-      );
-
-      const { access_token, expires_in } = response.data;
-      cachedToken = access_token;
-      tokenExpirationTime = Date.now() + (parseInt(expires_in, 10) * 1000);
-      return cachedToken;
-    } catch (error) {
-      console.error('[AUTH ERROR]', error.response?.data || error.message);
-      throw new Error('FAA Authentication failed.');
-    } finally {
-      tokenPromise = null;
-    }
-  })();
-
-  return tokenPromise;
-}
-
-/**
- * Converts a parameter query object into a unique string key for caching
- */
-function getCacheKey(params) {
-  if (params.location) return `LOC:${params.location.toUpperCase()}`;
-  if (params.latitude && params.longitude) {
-    return `GEO:${params.latitude.toFixed(3)},${params.longitude.toFixed(3)}:${params.radius}`;
-  }
-  return JSON.stringify(params);
-}
-
-/**
- * Raw call to FAA API. Should only be called through the rate-limited queue worker.
- */
-async function executeFaaApiCall(params) {
-  const token = await getBearerToken();
-  const url = `${BASE_URL}/nmsapi/v1/notams`;
-
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'nmsResponseFormat': 'AIXM'
-      },
-      params
-    });
-
-    if (response.data && response.data.data && Array.isArray(response.data.data.aixm)) {
-      return response.data.data.aixm;
-    }
-    return Array.isArray(response.data) ? response.data : [];
-  } catch (err) {
-    console.error(`[API ERROR] Params:`, params, `| Error:`, err.response?.data || err.message);
-    return [];
-  }
-}
-
-/**
- * Queue processing engine. Ensures global FAA requests strictly follow 1 req/sec pacing.
- */
-async function processQueue() {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
-
-  while (globalRequestQueue.length > 0) {
-    const { params, resolve, reject } = globalRequestQueue.shift();
-    const cacheKey = getCacheKey(params);
-    const now = Date.now();
-
-    if (notamCache.has(cacheKey)) {
-      const cached = notamCache.get(cacheKey);
-      if (now - cached.timestamp < CACHE_TTL_MS) {
-        resolve(cached.data);
-        continue;
-      }
-    }
-
-    try {
-      console.log(`[QUEUE WORKER] Fetching live FAA data for key: ${cacheKey}`);
-      const xmlData = await executeFaaApiCall(params);
-      
-      notamCache.set(cacheKey, { timestamp: now, data: xmlData });
-      
-      resolve(xmlData);
-    } catch (err) {
-      reject(err);
-    }
-
-    if (globalRequestQueue.length > 0) {
-      await delay(API_DELAY_MS);
-    }
-  }
-
-  isProcessingQueue = false;
-}
-
-/**
- * Fetches NOTAMs by either returning fresh cached data or queuing a network request
- */
-function enqueueFetchNotams(params) {
-  const cacheKey = getCacheKey(params);
-  const now = Date.now();
-
-  if (notamCache.has(cacheKey)) {
-    const cached = notamCache.get(cacheKey);
-    if (now - cached.timestamp < CACHE_TTL_MS) {
-      console.log(`[CACHE HIT] Serving key from 15m cache: ${cacheKey}`);
-      return Promise.resolve(cached.data);
-    }
-  }
-
-  console.log(`[CACHE MISS] Enqueueing request for key: ${cacheKey}`);
-  return new Promise((resolve, reject) => {
-    globalRequestQueue.push({ params, resolve, reject });
-    processQueue();
-  });
-}
-
-/**
- * Airport location resolver
- */
-async function resolveToCoordinates(input) {
-  if (typeof input === 'object' && input.lat !== undefined && input.lng !== undefined) {
-    return { lat: parseFloat(input.lat), lng: parseFloat(input.lng) };
-  }
-
-  if (typeof input === 'string' && input.includes(',')) {
-    const [lat, lng] = input.split(',').map(v => parseFloat(v.trim()));
-    if (!isNaN(lat) && !isNaN(lng)) return { lat, lng };
-  }
-
-  if (typeof input === 'string' && /^[A-Z0-9]{3,4}$/i.test(input.trim())) {
-    const code = input.trim().toUpperCase();
-    const localDb = {
-      'KPDK': { lat: 33.8756, lng: -84.3020 },
-      'PDK': { lat: 33.8756, lng: -84.3020 },
-      'KAVL': { lat: 35.4361, lng: -82.5420 },
-      'AVL': { lat: 35.4361, lng: -82.5420 }
-    };
-    if (localDb[code]) return localDb[code];
-
-    try {
-      const res = await axios.get(`https://www.airport-data.com/api/ap_info.json?icao=${code}`);
-      if (res.data && res.data.latitude && res.data.longitude) {
-        return { lat: parseFloat(res.data.latitude), lng: parseFloat(res.data.longitude) };
-      }
-    } catch {
-      console.warn(`[LOOKUP WARN] Could not resolve coordinates for ${code}.`);
-    }
-  }
-
-  return null;
-}
-
-/**
- * Normalizes deep AIXM XML structures to flat JSON
- */
-function normalizeAixmNotam(parsedXml) {
-  try {
-    const basicMessage = parsedXml?.AIXMBasicMessage;
-    const eventMember = basicMessage?.hasMember?.['event:Event'];
-    const timeSlice = eventMember?.['event:timeSlice']?.['event:EventTimeSlice'];
-    const textNotam = timeSlice?.['event:textNOTAM']?.['event:NOTAM'];
-    const extension = timeSlice?.['event:extension']?.['fnse:EventExtension'];
-    const validTime = timeSlice?.['gml:validTime']?.['gml:TimePeriod'];
-
-    let rawText = textNotam?.['event:text'] || '';
-    if (!rawText && textNotam?.['event:translation']) {
-      const translations = Array.isArray(textNotam['event:translation']) 
-        ? textNotam['event:translation'] 
-        : [textNotam['event:translation']];
-      
-      const icaoTranslation = translations.find(t => t?.['event:NOTAMTranslation']?.['event:type'] === 'OTHER:ICAO');
-      rawText = icaoTranslation?.['event:NOTAMTranslation']?.['event:formattedText']?.['html:div']?.['#text'] || '';
-    }
-
-    const series = textNotam?.['event:series'] || '';
-    const number = textNotam?.['event:number'] || '';
-    const year = textNotam?.['event:year'] ? String(textNotam['event:year']).slice(-2) : '';
-    const notamId = series && number ? `${series}${String(number).padStart(4, '0')}/${year}` : 'N/A';
-
-    return {
-      id: notamId,
-      facility: extension?.['fnse:icaoLocation'] || textNotam?.['event:location'] || 'UNKNOWN',
-      airportName: extension?.['fnse:airportname'] || '',
-      type: textNotam?.['event:type'] || 'N',
-      effectiveStart: validTime?.['gml:beginPosition'] || null,
-      effectiveEnd: validTime?.['gml:endPosition'] || null,
-      coordinates: textNotam?.['event:coordinates'] || null,
-      radiusNM: textNotam?.['event:radius'] || null,
-      text: rawText.replace(/<pre>|<\/pre>/gi, '').trim(),
-      classification: extension?.['fnse:classification'] || 'CIVIL'
-    };
-  } catch {
-    return { raw: parsedXml };
-  }
-}
-
-app.post('/api/notams/route', async (req, res) => {
-  try {
-    const { origin, destination, waypoints = [], radius = 5 } = req.body;
-
-    if (!origin || !destination) {
-      return res.status(400).json({ error: 'Both "origin" and "destination" are required.' });
-    }
-
-    const rawPoints = [origin, ...waypoints, destination];
-    const queryList = [];
-
-    // 1. Collect Location queries
-    for (const pt of rawPoints) {
-      if (typeof pt === 'string' && /^[A-Z0-9]{3,4}$/i.test(pt.trim())) {
-        queryList.push({ location: pt.trim().toUpperCase() });
-      }
-    }
-
-    // 2. Resolve coordinates
-    const resolvedCoords = [];
-    for (const pt of rawPoints) {
-      const coord = await resolveToCoordinates(pt);
-      if (coord) resolvedCoords.push(coord);
-    }
-
-    // 3. Distance sampling corridor
-    const STEP_DISTANCE_NM = radius * 1.5;
-    for (let i = 0; i < resolvedCoords.length - 1; i++) {
-      const start = resolvedCoords[i];
-      const end = resolvedCoords[i + 1];
-
-      const segmentDist = calculateDistanceNM(start.lat, start.lng, end.lat, end.lng);
-      const steps = Math.floor(segmentDist / STEP_DISTANCE_NM);
-
-      queryList.push({ latitude: start.lat, longitude: start.lng, radius });
-
-      for (let s = 1; s <= steps; s++) {
-        const fraction = (s * STEP_DISTANCE_NM) / segmentDist;
-        const interpLat = start.lat + (end.lat - start.lat) * fraction;
-        const interpLng = start.lng + (end.lng - start.lng) * fraction;
-
-        queryList.push({
-          latitude: Number(interpLat.toFixed(4)),
-          longitude: Number(interpLng.toFixed(4)),
-          radius
-        });
-      }
-    }
-
-    if (resolvedCoords.length > 0) {
-      const last = resolvedCoords[resolvedCoords.length - 1];
-      queryList.push({ latitude: last.lat, longitude: last.lng, radius });
-    }
-
-    // 4. Concurrently request points through the thread-safe queue/cache system
-    const rawXmlPromises = queryList.map(params => enqueueFetchNotams(params));
-    const results = await Promise.all(rawXmlPromises);
-    const rawXmlNotams = results.flat();
-
-    // 5. Deduplicate and normalize to JSON
-    const uniqueXmlStrings = Array.from(new Set(rawXmlNotams));
-    const cleanedNotams = uniqueXmlStrings.map(xmlStr => {
-      try {
-        const parsed = xmlParser.parse(xmlStr);
-        return normalizeAixmNotam(parsed);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
-
-    return res.json({
-      count: cleanedNotams.length,
-      corridorRadiusNM: radius,
-      resolvedWaypoints: resolvedCoords,
-      notams: cleanedNotams
-    });
-
-  } catch (error) {
-    console.error('[ROUTE ERROR]', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// Load SSL certificates and create HTTPS server
-const sslOptions = {
-  key: fs.readFileSync('/etc/letsencrypt/live/adsb-radar.duckdns.org/privkey.pem'),
-  cert: fs.readFileSync('/etc/letsencrypt/live/adsb-radar.duckdns.org/fullchain.pem')
+  return (tokenPromise = axios.post(`${NMS_BASE_URL}/v1/auth/token`, 'grant_type=client_credentials', { headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Basic ${Buffer.from(`${NMS_CLIENT_ID}:${NMS_CLIENT_SECRET}`).toString('base64')}` }, timeout: 60000 }).then(r => { cachedToken = r.data.access_token; tokenExpirationTime = Date.now() + r.data.expires_in * 1000; return cachedToken; }).finally(() => { tokenPromise = null; }));
 };
 
-https.createServer(sslOptions, app).listen(PORT, '0.0.0.0', () => {
-  console.log(`Secure FAA NMS NOTAM Service running at https://adsb-radar.duckdns.org:${PORT}/api/notams/route`);
+const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSIgnore: false }), deepFind = (obj, k) => { if (!obj || typeof obj !== 'object') return null; if (k in obj) return obj[k]; for (const key in obj) { const r = deepFind(obj[key], k); if (r) return r; } return null; }, firstNumber = v => { if (!v) return null; const m = String(v).match(/-?\d+(?:\.\d+)?/g); return m ? Number(m[0]) : null; };
+
+const extractCoordinates = (mObj, rawText = '') => {
+  const posStr = deepFind(mObj, 'gml:pos') || deepFind(mObj, 'pos');
+  if (posStr?.['#text'] || typeof posStr === 'string') {
+    const p = (posStr['#text'] || posStr).trim().split(/\s+/).map(Number);
+    if (p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])) return Math.abs(p[0]) <= 90 ? { latitude: p[0], longitude: p[1], polygon: null } : { latitude: p[1], longitude: p[0], polygon: null };
+  }
+  if (rawText) {
+    const matches = rawText.match(/\b\d{4,6}[NS]\d{5,6}[EW]\b/gi);
+    if (matches) {
+      const pts = matches.map(t => {
+        const m = t.match(/(\d{2})(\d{2})(\d{2})?([NS])\s*(\d{3})(\d{2})(\d{2})?([EW])/i);
+        if (!m) return null;
+        const [, ld, lm, ls, lDir, od, om, os, oDir] = m;
+        let lat = parseInt(ld, 10) + parseInt(lm, 10) / 60 + (ls ? parseInt(ls, 10) / 3600 : 0), lon = parseInt(od, 10) + parseInt(om, 10) / 60 + (os ? parseInt(os, 10) / 3600 : 0);
+        return { latitude: lDir.toUpperCase() === 'S' ? -lat : lat, longitude: oDir.toUpperCase() === 'W' ? -lon : lon };
+      }).filter(Boolean);
+      if (pts.length === 1) return { ...pts[0], polygon: null };
+      if (pts.length > 1) return { latitude: pts.reduce((a, p) => a + p.latitude, 0) / pts.length, longitude: pts.reduce((a, p) => a + p.longitude, 0) / pts.length, polygon: pts };
+    }
+  }
+  return null;
+};
+
+const normalizeAixmNotam = pXml => {
+  try {
+    const ev = deepFind(pXml, 'event:Event') || pXml, txt = deepFind(ev, 'event:textNOTAM'), ext = deepFind(ev, 'fnse:EventExtension'), vt = deepFind(ev, 'gml:validTime') || deepFind(ev, 'validTime');
+    let rt = deepFind(txt, 'event:text') || '';
+    if (!rt) { const tr = [].concat(deepFind(txt, 'event:translation') || []); const ic = tr.find(t => deepFind(t, 'event:type') === 'OTHER:ICAO'); rt = deepFind(ic, '#text') || deepFind(ic, 'event:formattedText') || ''; }
+    const ser = deepFind(txt, 'event:series') || '', num = deepFind(txt, 'event:number') || '', yr = deepFind(txt, 'event:year') ? String(deepFind(txt, 'event:year')).slice(-2) : '', nms = deepFind(ev, 'event:nmsId') || deepFind(ev, 'event:id') || ev['@_gml:id'] || null, pt = extractCoordinates(ev, rt);
+    return { id: ser && num ? `${ser}${String(num).padStart(4, '0')}/${yr}` : String(nms || ''), nmsId: nms ? String(nms) : null, facility: deepFind(ext, 'fnse:icaoLocation') || deepFind(txt, 'event:location') || 'UNKNOWN', airportName: deepFind(ext, 'fnse:airportname') || '', type: deepFind(txt, 'event:type') || 'N', effectiveStart: deepFind(vt, 'gml:beginPosition') || deepFind(vt, 'beginPosition') || null, effectiveEnd: deepFind(vt, 'gml:endPosition') || deepFind(vt, 'endPosition') || null, coordinates: pt?.polygon ? JSON.stringify(pt.polygon) : null, latitude: pt?.latitude ?? null, longitude: pt?.longitude ?? null, radiusNM: firstNumber(deepFind(txt, 'event:radius')), text: String(rt).replace(/<pre>|<\/pre>/gi, '').trim(), classification: deepFind(ext, 'fnse:classification') || 'CIVIL', raw: pXml };
+  } catch { return { id: null, raw: pXml }; }
+};
+
+const decompressIfNeeded = async buf => {
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) return gunzip(buf);
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nms-notam-')), zp = path.join(tmp, 'il.zip');
+    try { fs.writeFileSync(zp, buf); await execFileAsync('unzip', ['-o', zp, '-d', tmp]); const f = fs.readdirSync(tmp).filter(n => n !== 'il.zip'); return fs.readFileSync(path.join(tmp, f[0])); } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  }
+  return buf;
+};
+
+const upsertNotam = db.prepare(`INSERT INTO notams (id, nms_id, facility, airport_name, type, classification, effective_start, effective_end, latitude, longitude, radius_nm, coordinates, text, raw_json, updated_at) VALUES (@id, @nmsId, @facility, @airportName, @type, @classification, @effectiveStart, @effectiveEnd, @latitude, @longitude, @radiusNM, @coordinates, @text, @rawJson, @updatedAt) ON CONFLICT(id) DO UPDATE SET nms_id=excluded.nms_id, facility=excluded.facility, airport_name=excluded.airport_name, type=excluded.type, classification=excluded.classification, effective_start=excluded.effective_start, effective_end=excluded.effective_end, latitude=excluded.latitude, longitude=excluded.longitude, radius_nm=excluded.radius_nm, coordinates=excluded.coordinates, text=excluded.text, raw_json=excluded.raw_json, updated_at=excluded.updated_at`);
+const deleteNotam = db.prepare('DELETE FROM notams WHERE id = ? OR nms_id = ?'), toPrim = v => v === undefined || v === null ? null : (typeof v === 'object' && !Buffer.isBuffer(v) ? JSON.stringify(v) : String(v));
+const saveNotam = n => {
+  if (!n?.id || n.id === 'N/A') return false;
+  upsertNotam.run({ id: toPrim(n.id), nmsId: toPrim(n.nmsId), facility: toPrim(n.facility) || 'UNKNOWN', airportName: toPrim(n.airportName) || '', type: toPrim(n.type) || 'N', classification: toPrim(n.classification) || 'CIVIL', effectiveStart: toPrim(n.effectiveStart), effectiveEnd: toPrim(n.effectiveEnd), latitude: typeof n.latitude === 'number' ? n.latitude : null, longitude: typeof n.longitude === 'number' ? n.longitude : null, radiusNM: typeof n.radiusNM === 'number' ? n.radiusNM : null, coordinates: typeof n.coordinates === 'string' ? n.coordinates : (n.coordinates ? JSON.stringify(n.coordinates) : null), text: toPrim(n.text) || '', rawJson: typeof n.raw === 'string' ? n.raw : JSON.stringify(n.raw), updatedAt: new Date().toISOString() });
+  return true;
+};
+
+const extractAixmMembers = (obj, res = []) => {
+  if (!obj || typeof obj !== 'object') return res;
+  if (obj.AIXMBasicMessage) return extractAixmMembers(obj.AIXMBasicMessage, res);
+  if (obj.hasMember) { [].concat(obj.hasMember).forEach(m => extractAixmMembers(m, res)); return res; }
+  if (obj['event:Event'] || obj.Event || obj.timeSlice) { res.push(obj['event:Event'] || obj.Event || obj); return res; }
+  for (const k of Object.keys(obj)) if (typeof obj[k] === 'object') extractAixmMembers(obj[k], res);
+  return res;
+};
+
+let syncInProgress = false;
+const performInitialLoad = async () => {
+  const t = await getBearerToken(), r = await axios.get(`${BASE_URL}/nmsapi/v1/notams/il`, { headers: { Authorization: `Bearer ${t}` }, maxRedirects: 0, validateStatus: s => s >= 200 && s < 400 });
+  const b = [302, 307].includes(r.status) ? Buffer.from((await axios.get(r.headers.location.startsWith('http') ? r.headers.location : `${BASE_URL}${r.headers.location}`, { headers: { Authorization: `Bearer ${t}` }, responseType: 'arraybuffer' })).data) : Buffer.from(r.data);
+  const rm = extractAixmMembers(xmlParser.parse((await decompressIfNeeded(b)).toString('utf8')));
+  db.transaction(() => rm.forEach(m => saveNotam(normalizeAixmNotam({ AIXMBasicMessage: { hasMember: { 'event:Event': m } } }))))();
+  const now = new Date().toISOString(); ['last_initial_load', 'last_successful_sync'].forEach(k => setState(k, now)); setState('last_sync_type', 'initial_load');
+};
+
+const performDeltaSync = async () => {
+  const f = new Date(getState('last_successful_sync') ? new Date(getState('last_successful_sync')).getTime() - NOTAM_DELTA_LOOKBACK_MS : Date.now() - NOTAM_DELTA_LOOKBACK_MS).toISOString();
+  const r = await axios.get(`${BASE_URL}/nmsapi/v1/notams`, { headers: { Authorization: `Bearer ${await getBearerToken()}`, nmsResponseFormat: 'AIXM' }, params: { lastUpdatedDate: f } });
+  const ri = [].concat(r.data?.data?.aixm || r.data || []);
+  db.transaction(() => ri.forEach(rw => { try { const n = normalizeAixmNotam(typeof rw === 'string' ? xmlParser.parse(rw) : rw); if (!n.id || n.id === 'N/A') return; if (/(CANCEL|CANCELLED|WITHDRAWN)/i.test(`${n.type} ${n.text}`)) deleteNotam.run(n.id, n.nmsId || ''); else saveNotam(n); } catch {} }))();
+  const now = new Date().toISOString(); setState('last_successful_sync', now); setState('last_sync_type', 'delta'); setState('last_delta_count', ri.length);
+};
+
+const synchronizeNotams = async (f = false) => {
+  if (syncInProgress) return; syncInProgress = true;
+  try { const li = getState('last_initial_load'), ls = getState('last_successful_sync'); if (f || !li || !ls || (Date.now() - new Date(li).getTime() > NOTAM_INITIAL_LOAD_STALE_MS)) await performInitialLoad(); else await performDeltaSync(); }
+  catch (e) { setState('last_sync_error', new Date().toISOString()); setState('last_sync_error_message', e.message); } finally { syncInProgress = false; }
+};
+
+const calcDistNM = (l1, n1, l2, n2) => 3440.065 * 2 * Math.atan2(Math.sqrt(Math.sin((l2 - l1) * Math.PI / 360) ** 2 + Math.cos(l1 * Math.PI / 180) * Math.cos(l2 * Math.PI / 180) * Math.sin((n2 - n1) * Math.PI / 360) ** 2), Math.sqrt(1 - (Math.sin((l2 - l1) * Math.PI / 360) ** 2 + Math.cos(l1 * Math.PI / 180) * Math.cos(l2 * Math.PI / 180) * Math.sin((n2 - n1) * Math.PI / 360) ** 2)));
+const queryNearbyNotams = (lat, lon, rNM) => db.prepare('SELECT * FROM notams WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?').all(lat - rNM / 60, lat + rNM / 60, lon - rNM / (60 * Math.max(Math.cos(lat * Math.PI / 180), 0.1)), lon + rNM / (60 * Math.max(Math.cos(lat * Math.PI / 180), 0.1))).map(row => ({ row, dist: calcDistNM(lat, lon, row.latitude, row.longitude) })).filter(i => i.dist <= rNM).map(({ row, dist }) => ({ id: row.id, nmsId: row.nms_id, facility: row.facility, airportName: row.airport_name, type: row.type, classification: row.classification, effectiveStart: row.effective_start, effectiveEnd: row.effective_end, coordinates: row.coordinates, radiusNM: row.radius_nm, text: row.text, distanceNM: Number(dist.toFixed(2)) }));
+
+app.get('/api/notams/status', (req, res) => res.json({ count: db.prepare('SELECT COUNT(*) AS c FROM notams').get().c, lastInitialLoad: getState('last_initial_load'), lastSuccessfulSync: getState('last_successful_sync'), syncInProgress, databasePath: NOTAM_DB_PATH }));
+app.get('/api/debug/notams', (req, res) => res.json({ total: db.prepare('SELECT COUNT(*) AS c FROM notams').get().c, byClassification: db.prepare('SELECT classification, COUNT(*) AS count FROM notams GROUP BY classification').all() }));
+app.post('/api/debug/sync', (req, res) => { if (syncInProgress) return res.status(409).json({ error: 'Sync running' }); synchronizeNotams(String(req.query.initial).toLowerCase() === 'true'); res.status(202).json({ message: 'Sync started' }); });
+app.get('/api/notams/nearby', (req, res) => { const lat = Number(req.query.latitude), lon = Number(req.query.longitude), r = Number(req.query.radius || 50); if (!Number.isFinite(lat) || !Number.isFinite(lon)) return res.status(400).json({ error: 'Missing coordinates' }); res.json({ notams: queryNearbyNotams(lat, lon, r) }); });
+app.post('/api/notams/route', async (req, res) => {
+  const { origin, destination, waypoints = [], radius = 5 } = req.body;
+  if (!origin || !destination) return res.status(400).json({ error: 'Origin and destination required' });
+  const resolve = async (i) => typeof i === 'object' ? { lat: Number(i.lat), lng: Number(i.lng) } : { lat: 33.8756, lng: -84.3020 }, pts = await Promise.all([origin, ...waypoints, destination].map(resolve)), all = new Map();
+  pts.forEach(p => p && queryNearbyNotams(p.lat, p.lng, radius).forEach(n => all.set(n.id, n)));
+  res.json({ notams: Array.from(all.values()) });
 });
+
+(SERVER_PROTOCOL === 'HTTPS' || (SERVER_PROTOCOL === 'AUTO' && fs.existsSync(HTTPS_KEY) && fs.existsSync(HTTPS_CERT)) ? require('https').createServer({ key: fs.readFileSync(HTTPS_KEY), cert: fs.readFileSync(HTTPS_CERT) }, app) : app).listen(PORT, '0.0.0.0', () => console.log(`NOTAM service running on port ${PORT}`));
+setTimeout(() => synchronizeNotams().catch(console.error), 1000); setInterval(() => synchronizeNotams().catch(console.error), NOTAM_SYNC_INTERVAL_MS);
+process.on('SIGINT', () => { db.close(); process.exit(0); }); process.on('SIGTERM', () => { db.close(); process.exit(0); });
