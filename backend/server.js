@@ -22,23 +22,61 @@ const getBearerToken = () => {
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSIgnore: false }), deepFind = (obj, k) => { if (!obj || typeof obj !== 'object') return null; if (k in obj) return obj[k]; for (const key in obj) { const r = deepFind(obj[key], k); if (r) return r; } return null; }, firstNumber = v => { if (!v) return null; const m = String(v).match(/-?\d+(?:\.\d+)?/g); return m ? Number(m[0]) : null; };
 
 const extractCoordinates = (mObj, rawText = '') => {
+  // 1. Capture AIXM Polygons (gml:posList)
+  const posList = deepFind(mObj, 'gml:posList') || deepFind(mObj, 'posList');
+  if (posList?.['#text'] || typeof posList === 'string') {
+    const coords = (posList['#text'] || posList).trim().split(/\s+/).map(Number);
+    const pts = [];
+    for (let i = 0; i < coords.length; i += 2) {
+      if (Number.isFinite(coords[i]) && Number.isFinite(coords[i+1])) {
+        pts.push(Math.abs(coords[i]) <= 90 ? { latitude: coords[i], longitude: coords[i+1] } : { latitude: coords[i+1], longitude: coords[i] });
+      }
+    }
+    if (pts.length > 1) {
+      return {
+        latitude: pts.reduce((a, p) => a + p.latitude, 0) / pts.length,
+        longitude: pts.reduce((a, p) => a + p.longitude, 0) / pts.length,
+        polygon: pts
+      };
+    }
+  }
+
+  // 2. Capture Single Points (gml:pos)
   const posStr = deepFind(mObj, 'gml:pos') || deepFind(mObj, 'pos');
   if (posStr?.['#text'] || typeof posStr === 'string') {
     const p = (posStr['#text'] || posStr).trim().split(/\s+/).map(Number);
-    if (p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])) return Math.abs(p[0]) <= 90 ? { latitude: p[0], longitude: p[1], polygon: null } : { latitude: p[1], longitude: p[0], polygon: null };
+    if (p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])) {
+      return Math.abs(p[0]) <= 90 ? { latitude: p[0], longitude: p[1], polygon: null } : { latitude: p[1], longitude: p[0], polygon: null };
+    }
   }
+
+  // 3. Regex Fallback for Text-based Coordinates
   if (rawText) {
-    const matches = rawText.match(/\b\d{4,6}[NS]\d{5,6}[EW]\b/gi);
-    if (matches) {
-      const pts = matches.map(t => {
-        const m = t.match(/(\d{2})(\d{2})(\d{2})?([NS])\s*(\d{3})(\d{2})(\d{2})?([EW])/i);
-        if (!m) return null;
+    // Strip HTML entities that interrupt coordinate pairs
+    const cleanText = rawText.replace(/&#\w+;/g, ' '); 
+    // Matches: DDMM(SS.ss)N [space/dash] DDDMM(SS.ss)W
+    const regex = /\b(\d{2})(\d{2})(\d{2}(?:\.\d+)?)?([NS])[\s\-]*(\d{2,3})(\d{2})(\d{2}(?:\.\d+)?)?([EW])\b/gi;
+    const matches = [...cleanText.matchAll(regex)];
+
+    if (matches.length > 0) {
+      const pts = matches.map(m => {
         const [, ld, lm, ls, lDir, od, om, os, oDir] = m;
-        let lat = parseInt(ld, 10) + parseInt(lm, 10) / 60 + (ls ? parseInt(ls, 10) / 3600 : 0), lon = parseInt(od, 10) + parseInt(om, 10) / 60 + (os ? parseInt(os, 10) / 3600 : 0);
-        return { latitude: lDir.toUpperCase() === 'S' ? -lat : lat, longitude: oDir.toUpperCase() === 'W' ? -lon : lon };
+        // Parse degrees, minutes, and optional seconds (now supporting decimals)
+        let lat = parseInt(ld, 10) + parseInt(lm, 10) / 60 + (ls ? parseFloat(ls) / 3600 : 0);
+        let lon = parseInt(od, 10) + parseInt(om, 10) / 60 + (os ? parseFloat(os) / 3600 : 0);
+        
+        return { 
+          latitude: lDir.toUpperCase() === 'S' ? -lat : lat, 
+          longitude: oDir.toUpperCase() === 'W' ? -lon : lon 
+        };
       }).filter(Boolean);
+
       if (pts.length === 1) return { ...pts[0], polygon: null };
-      if (pts.length > 1) return { latitude: pts.reduce((a, p) => a + p.latitude, 0) / pts.length, longitude: pts.reduce((a, p) => a + p.longitude, 0) / pts.length, polygon: pts };
+      if (pts.length > 1) return { 
+        latitude: pts.reduce((a, p) => a + p.latitude, 0) / pts.length, 
+        longitude: pts.reduce((a, p) => a + p.longitude, 0) / pts.length, 
+        polygon: pts 
+      };
     }
   }
   return null;
@@ -107,7 +145,14 @@ const calcDistNM = (l1, n1, l2, n2) => 3440.065 * 2 * Math.atan2(Math.sqrt(Math.
 const queryNearbyNotams = (lat, lon, rNM) => db.prepare('SELECT * FROM notams WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?').all(lat - rNM / 60, lat + rNM / 60, lon - rNM / (60 * Math.max(Math.cos(lat * Math.PI / 180), 0.1)), lon + rNM / (60 * Math.max(Math.cos(lat * Math.PI / 180), 0.1))).map(row => ({ row, dist: calcDistNM(lat, lon, row.latitude, row.longitude) })).filter(i => i.dist <= rNM).map(({ row, dist }) => ({ id: row.id, nmsId: row.nms_id, facility: row.facility, airportName: row.airport_name, type: row.type, classification: row.classification, effectiveStart: row.effective_start, effectiveEnd: row.effective_end, coordinates: row.coordinates, radiusNM: row.radius_nm, text: row.text, distanceNM: Number(dist.toFixed(2)) }));
 
 app.get('/api/notams/status', (req, res) => res.json({ count: db.prepare('SELECT COUNT(*) AS c FROM notams').get().c, lastInitialLoad: getState('last_initial_load'), lastSuccessfulSync: getState('last_successful_sync'), syncInProgress, databasePath: NOTAM_DB_PATH }));
-app.get('/api/debug/notams', (req, res) => res.json({ total: db.prepare('SELECT COUNT(*) AS c FROM notams').get().c, byClassification: db.prepare('SELECT classification, COUNT(*) AS count FROM notams GROUP BY classification').all() }));
+app.get('/api/debug/notams', (req, res) => res.json({ 
+  total: db.prepare('SELECT COUNT(*) AS c FROM notams').get().c, 
+  parsedLocations: db.prepare('SELECT COUNT(*) AS c FROM notams WHERE latitude IS NOT NULL OR coordinates IS NOT NULL').get().c,
+  pointOnlyLocations: db.prepare('SELECT COUNT(*) AS c FROM notams WHERE latitude IS NOT NULL AND coordinates IS NULL').get().c,
+  polygonRegions: db.prepare('SELECT COUNT(*) AS c FROM notams WHERE coordinates IS NOT NULL').get().c,
+  missingLocations: db.prepare('SELECT COUNT(*) AS c FROM notams WHERE latitude IS NULL AND coordinates IS NULL').get().c,
+  byClassification: db.prepare('SELECT classification, COUNT(*) AS count FROM notams GROUP BY classification').all() 
+}));
 app.post('/api/debug/sync', (req, res) => { if (syncInProgress) return res.status(409).json({ error: 'Sync running' }); synchronizeNotams(String(req.query.initial).toLowerCase() === 'true'); res.status(202).json({ message: 'Sync started' }); });
 app.get('/api/notams/nearby', (req, res) => { const lat = Number(req.query.latitude), lon = Number(req.query.longitude), r = Number(req.query.radius || 50); if (!Number.isFinite(lat) || !Number.isFinite(lon)) return res.status(400).json({ error: 'Missing coordinates' }); res.json({ notams: queryNearbyNotams(lat, lon, r) }); });
 app.post('/api/notams/route', async (req, res) => {
@@ -117,6 +162,9 @@ app.post('/api/notams/route', async (req, res) => {
   pts.forEach(p => p && queryNearbyNotams(p.lat, p.lng, radius).forEach(n => all.set(n.id, n)));
   res.json({ notams: Array.from(all.values()) });
 });
+app.get('/api/debug/missing', (req, res) => res.json({ 
+  samples: db.prepare('SELECT id, facility, type, text FROM notams WHERE latitude IS NULL AND coordinates IS NULL ORDER BY RANDOM() LIMIT 10').all() 
+}));
 
 (SERVER_PROTOCOL === 'HTTPS' || (SERVER_PROTOCOL === 'AUTO' && fs.existsSync(HTTPS_KEY) && fs.existsSync(HTTPS_CERT)) ? require('https').createServer({ key: fs.readFileSync(HTTPS_KEY), cert: fs.readFileSync(HTTPS_CERT) }, app) : app).listen(PORT, '0.0.0.0', () => console.log(`NOTAM service running on port ${PORT}`));
 setTimeout(() => synchronizeNotams().catch(console.error), 1000); setInterval(() => synchronizeNotams().catch(console.error), NOTAM_SYNC_INTERVAL_MS);
