@@ -8,6 +8,7 @@ import VectorSource from 'ol/source/Vector';
 import OSM from 'ol/source/OSM';
 import Feature from 'ol/Feature';
 import Point from 'ol/geom/Point';
+import LineString from 'ol/geom/LineString';
 import { circular as circularPolygon } from 'ol/geom/Polygon';
 import Overlay from 'ol/Overlay';
 import { fromLonLat } from 'ol/proj';
@@ -37,31 +38,31 @@ function parseIcaoCoordinates(coordStr) {
   return { lat, lon };
 }
 
-export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) {
+export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam, route = [] }) {
   const mapElement = useRef(null);
   const tooltipElement = useRef(null);
   const mapRef = useRef(null);
   const vectorSourceRef = useRef(new VectorSource());
   const overlayRef = useRef(null);
   
-  // Refs to avoid map re-creation when callbacks or hover props change
   const hoveredNotamIdRef = useRef(hoveredNotamId);
   const onHoverNotamRef = useRef(onHoverNotam);
-  const lastPlottedKeyRef = useRef('');
 
-  useEffect(() => {
-    hoveredNotamIdRef.current = hoveredNotamId;
-  }, [hoveredNotamId]);
+  useEffect(() => { hoveredNotamIdRef.current = hoveredNotamId; }, [hoveredNotamId]);
+  useEffect(() => { onHoverNotamRef.current = onHoverNotam; }, [onHoverNotam]);
 
-  useEffect(() => {
-    onHoverNotamRef.current = onHoverNotam;
-  }, [onHoverNotam]);
-
-  // Map Setup Effect - Runs ONLY ONCE on mount
   useEffect(() => {
     const vectorLayer = new VectorLayer({
       source: vectorSourceRef.current,
       style: (feature) => {
+        const type = feature.get('type');
+        
+        if (type === 'route') {
+          return new Style({
+            stroke: new Stroke({ color: '#8f02c7', width: 4, lineDash: [6, 4] })
+          });
+        }
+
         const isHovered = feature.get('id') === hoveredNotamIdRef.current;
         const level = feature.get('level') || 'low';
 
@@ -72,21 +73,21 @@ export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) 
         else if (level === 'info') color = '#0284c7';
 
         const strokeWidth = isHovered ? 4 : 2;
-        const radius = isHovered ? 10 : 7;
 
         if (feature.getGeometry().getType() === 'Point') {
           return new Style({
             image: new CircleStyle({
-              radius,
+              radius: isHovered ? 10 : 7,
               fill: new Fill({ color }),
               stroke: new Stroke({ color: '#ffffff', width: strokeWidth })
             })
           });
         }
 
+        // Polygon / Zone Styling
         return new Style({
           stroke: new Stroke({ color, width: strokeWidth }),
-          fill: new Fill({ color: color + '33' })
+          fill: new Fill({ color: color + '33' }) // 20% opacity hex
         });
       }
     });
@@ -100,15 +101,9 @@ export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) 
 
     const initialMap = new Map({
       target: mapElement.current,
-      layers: [
-        new TileLayer({ source: new OSM() }),
-        vectorLayer
-      ],
+      layers: [new TileLayer({ source: new OSM() }), vectorLayer],
       overlays: [overlay],
-      view: new View({
-        center: fromLonLat([-98.5795, 39.8283]),
-        zoom: 4
-      })
+      view: new View({ center: fromLonLat([-98.5795, 39.8283]), zoom: 4 })
     });
 
     initialMap.on('pointermove', (evt) => {
@@ -116,105 +111,94 @@ export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) 
         overlay.setPosition(undefined);
         return;
       }
-
+      
       const feature = initialMap.forEachFeatureAtPixel(evt.pixel, (f) => f);
-      if (feature) {
+      if (feature && feature.get('type') !== 'route') {
         const coordinates = evt.coordinate;
-        if (onHoverNotamRef.current) {
-          onHoverNotamRef.current(feature.get('id'));
-        }
+        if (onHoverNotamRef.current) onHoverNotamRef.current(feature.get('id'));
         overlay.setPosition(coordinates);
         if (mapElement.current) mapElement.current.style.cursor = 'pointer';
       } else {
-        if (onHoverNotamRef.current) {
-          onHoverNotamRef.current(null);
-        }
+        if (onHoverNotamRef.current) onHoverNotamRef.current(null);
         overlay.setPosition(undefined);
         if (mapElement.current) mapElement.current.style.cursor = '';
       }
     });
 
     mapRef.current = initialMap;
+    return () => initialMap.setTarget(null);
+  }, []); 
 
-    return () => {
-      initialMap.setTarget(null);
-    };
-  }, []); // Run ONCE on mount
-
-  // Vector Feature Data Update Effect
   useEffect(() => {
     if (!mapRef.current) return;
-
-    // Guard against re-fitting if NOTAM set hasn't changed
-    const currentKey = notams.map((n) => n.id || n.text).join('|');
-    if (currentKey === lastPlottedKeyRef.current) return;
-    lastPlottedKeyRef.current = currentKey;
-
     vectorSourceRef.current.clear();
-    const validCoords = [];
 
+    // 1. Draw Route Line
+    const routeCoords = [];
+    if (route && route.length > 0) {
+      route.forEach(leg => {
+        routeCoords.push(fromLonLat([leg.start.lon, leg.start.lat]));
+      });
+      const lastLeg = route[route.length - 1];
+      routeCoords.push(fromLonLat([lastLeg.end.lon, lastLeg.end.lat]));
+
+      const routeFeature = new Feature({
+        geometry: new LineString(routeCoords),
+        type: 'route'
+      });
+      vectorSourceRef.current.addFeature(routeFeature);
+    }
+
+    // 2. Draw NOTAMs
     notams.forEach((notam) => {
-      let lat = null;
-      let lon = null;
+      let lat = null, lon = null;
 
       if (typeof notam.coordinates === 'string') {
         const parsed = parseIcaoCoordinates(notam.coordinates);
-        if (parsed) {
-          lat = parsed.lat;
-          lon = parsed.lon;
-        }
+        if (parsed) { lat = parsed.lat; lon = parsed.lon; }
       } else if (Array.isArray(notam.coordinates) && notam.coordinates.length >= 2) {
-        lat = Number(notam.coordinates[1]);
-        lon = Number(notam.coordinates[0]);
+        lat = Number(notam.coordinates[1]); lon = Number(notam.coordinates[0]);
       } else if (notam.lat && notam.lng) {
-        lat = Number(notam.lat);
-        lon = Number(notam.lng);
+        lat = Number(notam.lat); lon = Number(notam.lng);
       }
 
       if (lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon)) {
         const finalLat = Math.abs(lat) > 90 ? lon : lat;
         const finalLon = Math.abs(lat) > 90 ? lat : lon;
-
         const centerCoords = fromLonLat([finalLon, finalLat]);
-        validCoords.push(centerCoords);
-
+        
+        // Treat anything > 1 NM as a zone polygon, otherwise a point
         const radiusMiles = notam.radiusNM || notam.radiusMiles || 0;
 
-        if (radiusMiles > 0) {
+        if (radiusMiles > 1) {
           const radiusMeters = radiusMiles * 1852;
           const circleGeom = circularPolygon([finalLon, finalLat], radiusMeters, 64)
             .transform('EPSG:4326', mapRef.current.getView().getProjection());
 
-          const circleFeature = new Feature({
+          vectorSourceRef.current.addFeature(new Feature({
             geometry: circleGeom,
-            id: notam.id,
-            text: notam.text,
-            level: notam.classification || notam.level
-          });
-          vectorSourceRef.current.addFeature(circleFeature);
+            id: notam.id, text: notam.text, level: notam.classification || notam.level, type: 'zone'
+          }));
         } else {
-          const pointFeature = new Feature({
+          vectorSourceRef.current.addFeature(new Feature({
             geometry: new Point(centerCoords),
-            id: notam.id,
-            text: notam.text,
-            level: notam.classification || notam.level
-          });
-          vectorSourceRef.current.addFeature(pointFeature);
+            id: notam.id, text: notam.text, level: notam.classification || notam.level, type: 'point'
+          }));
         }
       }
     });
 
-    if (validCoords.length > 0) {
-      const extent = vectorSourceRef.current.getExtent();
-      mapRef.current.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 10 });
+    // 3. Center Map strictly on the Route
+    if (routeCoords.length > 0) {
+      const routeLine = new LineString(routeCoords);
+      mapRef.current.getView().fit(routeLine.getExtent(), { padding: [60, 60, 60, 60], maxZoom: 10 });
+    } else if (vectorSourceRef.current.getFeatures().length > 0) {
+      mapRef.current.getView().fit(vectorSourceRef.current.getExtent(), { padding: [40, 40, 40, 40], maxZoom: 10 });
     }
-  }, [notams]);
+  }, [notams, route]);
 
-  // Re-render layer style smoothly on hover state changes
   useEffect(() => {
-    if (vectorSourceRef.current) {
-      vectorSourceRef.current.changed();
-    }
+    if (vectorSourceRef.current) vectorSourceRef.current.changed();
   }, [hoveredNotamId]);
 
   const activeNotam = notams.find((n) => n.id === hoveredNotamId);
@@ -225,8 +209,10 @@ export default function NotamMap({ notams = [], hoveredNotamId, onHoverNotam }) 
       <div ref={tooltipElement} className="ol-tooltip">
         {activeNotam && (
           <div style={{ maxWidth: '250px', fontSize: '11px', color: '#f8fafc' }}>
-            <strong>{activeNotam.id} [{activeNotam.facility}]</strong>
-            <p style={{ margin: '4px 0 0 0', whiteSpace: 'pre-wrap' }}>{activeNotam.text}</p>
+            <strong style={{ display: 'block', borderBottom: '1px solid #475569', paddingBottom: '4px', marginBottom: '4px' }}>
+              {activeNotam.category}
+            </strong>
+            <p style={{ margin: '0', whiteSpace: 'pre-wrap' }}>{activeNotam.text}</p>
           </div>
         )}
       </div>

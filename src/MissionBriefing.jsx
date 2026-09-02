@@ -415,34 +415,55 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     setNotamsError('');
 
     try {
-      const legPromises = missionPlan.legs.map((leg) => {
-        const originCode = leg.start?.icao || leg.start?.id || 'UNKNOWN';
-        const destCode = leg.end?.icao || leg.end?.id || 'UNKNOWN';
+      // 1. Resolve Origin (Start of the first leg)
+      const originRaw = missionPlan.legs[0].start;
+      const originApt = findAirport(originRaw);
+      const originCoord = {
+        lat: originRaw.lat || originApt?.lat,
+        lng: originRaw.lon || originApt?.lon || originApt?.lng
+      };
 
-        return fetch(NOTAM_ENDPOINT, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            origin: originCode,
-            destination: destCode,
-            radius: 5
-          })
+      // 2. Resolve Destination (End of the last leg)
+      const destRaw = missionPlan.legs[missionPlan.legs.length - 1].end;
+      const destApt = findAirport(destRaw);
+      const destCoord = {
+        lat: destRaw.lat || destApt?.lat,
+        lng: destRaw.lon || destApt?.lon || destApt?.lng
+      };
+
+      // 3. Resolve Waypoints (Intermediate nodes)
+      // We map the waypoints to {lat, lng} to satisfy the server's resolve function
+      const waypointCoords = (missionPlan.waypoints || []).map(wp => ({
+        lat: wp.lat,
+        lng: wp.lon || wp.lng
+      }));
+
+      // 4. Single POST request for the entire flight path
+      // Note: We send 'lng' because server.js uses 'lng' in its resolve logic
+      const response = await fetch(NOTAM_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          origin: originCoord,
+          destination: destCoord,
+          waypoints: waypointCoords,
+          radius: 5
         })
-          .then(res => res.ok ? res.json() : Promise.reject(`HTTP ${res.status}`))
-          .then(data => data.notams || [])
-          .catch(err => {
-            console.warn(`Failed fetching NOTAMs for leg ${originCode}->${destCode}:`, err);
-            return [];
-          });
       });
 
-      const results = await Promise.all(legPromises);
-      const flatNotams = results.flat();
+      if (!response.ok) {
+        throw new Error(`Server responded with ${response.status}`);
+      }
 
+      const data = await response.json();
+      const rawNotams = data.notams || [];
+
+      // 5. Deduplicate and Categorize
       const seen = new Set();
       const uniqueNotams = [];
 
-      for (const item of flatNotams) {
+      for (const item of rawNotams) {
+        // Create a unique key based on ID and text to prevent duplicates from overlapping radii
         const key = `${item.id || ''}_${item.text || ''}`;
         if (!seen.has(key)) {
           seen.add(key);
@@ -451,18 +472,20 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         }
       }
 
-      // Sort by highest priority (TFRs first, Obstacles second, General lower)
+      // Sort by priority (TFRs/Critical first)
       uniqueNotams.sort((a, b) => a.priority - b.priority);
 
       setNotams(uniqueNotams);
-    } catch {
-      setNotamsError('Error fetching NOTAMs from server endpoint.');
+    } catch (err) {
+      console.error('NOTAM Fetch Error:', err);
+      setNotamsError('Error fetching NOTAMs from server. Ensure the service is reachable.');
     } finally {
       setNotamsLoading(false);
     }
-  }, [missionPlan.legs]);
+  }, [missionPlan]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchNotamsForLegs();
   }, [fetchNotamsForLegs]);
 
@@ -707,20 +730,18 @@ export default function MissionBriefing({ missionPlan, onBack }) {
                     onMouseEnter={() => setHoveredNotamId(n.id)}
                     onMouseLeave={() => setHoveredNotamId(null)}
                   >
-                    <div className="notam-card-header">
-                      <div>
-                        <span className="notam-id">{n.id}</span>
-                        <span className="notam-facility">[{n.facility}]</span>
-                      </div>
+                    <div className="notam-card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <span className={`notam-badge badge-${n.badge}`}>{n.category}</span>
+                      {(n.effectiveStart || n.effectiveEnd) && (
+                        <div className="notam-dates" style={{ fontSize: '11px', fontWeight: 600, color: '#334155' }}>
+                          {n.effectiveStart ? new Date(n.effectiveStart).toLocaleDateString() : 'Now'} ➔ {n.effectiveEnd ? new Date(n.effectiveEnd).toLocaleDateString() : 'UFN'}
+                        </div>
+                      )}
                     </div>
-                    <p className="notam-text">{n.text}</p>
-                    {(n.effectiveStart || n.effectiveEnd) && (
-                      <div className="notam-dates">
-                        Effective: {n.effectiveStart ? new Date(n.effectiveStart).toUTCString() : 'Immediate'} 
-                        {n.effectiveEnd ? ` ➔ ${new Date(n.effectiveEnd).toUTCString()}` : ' ➔ Permanent / UFN'}
-                      </div>
-                    )}
+                    <p className="notam-text" style={{ fontSize: '13px', margin: '8px 0', lineHeight: '1.4' }}>{n.text}</p>
+                    <div className="notam-footer" style={{ fontSize: '10px', color: '#94a3b8', borderTop: '1px solid #e2e8f0', paddingTop: '4px' }}>
+                      Ref: {n.id} [{n.facility}]
+                    </div>
                   </div>
                 ))
               )}
@@ -730,7 +751,8 @@ export default function MissionBriefing({ missionPlan, onBack }) {
               <NotamMap 
                 notams={filteredNotams} 
                 hoveredNotamId={hoveredNotamId} 
-                onHoverNotam={setHoveredNotamId} 
+                onHoverNotam={setHoveredNotamId}
+                route={missionPlan.legs}
               />
             </div>
           </div>
@@ -791,7 +813,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
                 </div>
               ))
             ) : (
-              <p className="empty-msg">Click "Refresh Weather" to load combined weather reports.</p>
+              <p className="empty-msg">Click "Refresh Weather" to load weather reports.</p>
             )}
           </div>
         </section>
