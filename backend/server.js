@@ -7,8 +7,11 @@ const { PORT = 3000, NMS_CLIENT_ID, NMS_CLIENT_SECRET, NMS_BASE_URL = 'https://a
 const BASE_URL = NMS_BASE_URL, HTTPS_KEY = process.env.HTTPS_KEY || `/etc/letsencrypt/live/${DUCKDNS_HOST}/privkey.pem`, HTTPS_CERT = process.env.HTTPS_CERT || `/etc/letsencrypt/live/${DUCKDNS_HOST}/fullchain.pem`;
 
 if (!NMS_CLIENT_ID || !NMS_CLIENT_SECRET) console.warn('[CONFIG] NMS_CLIENT_ID / NMS_CLIENT_SECRET are not set.');
+console.log('[INIT] Ensuring data directory exists...');
 fs.mkdirSync(path.dirname(NOTAM_DB_PATH), { recursive: true });
+console.log(`[INIT] Opening SQLite database at: ${NOTAM_DB_PATH}`);
 const db = new Database(NOTAM_DB_PATH);
+console.log('[INIT] Executing base schema creation (notams & sync_state)...');
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS notams (id TEXT PRIMARY KEY, nms_id TEXT, facility TEXT, airport_name TEXT, type TEXT, classification TEXT, effective_start TEXT, effective_end TEXT, latitude REAL, longitude REAL, radius_nm REAL, coordinates TEXT, text TEXT, raw_json TEXT, updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_notams_facility ON notams(facility); CREATE INDEX IF NOT EXISTS idx_notams_effective_end ON notams(effective_end); CREATE INDEX IF NOT EXISTS idx_notams_lat_lon ON notams(latitude, longitude); CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 
 const getState = k => db.prepare('SELECT value FROM sync_state WHERE key = ?').get(k)?.value || null, setState = (k, v) => db.prepare('INSERT INTO sync_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, String(v));
@@ -22,6 +25,7 @@ const getBearerToken = () => {
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSIgnore: false }), deepFind = (obj, k) => { if (!obj || typeof obj !== 'object') return null; if (k in obj) return obj[k]; for (const key in obj) { const r = deepFind(obj[key], k); if (r) return r; } return null; }, firstNumber = v => { if (!v) return null; const m = String(v).match(/-?\d+(?:\.\d+)?/g); return m ? Number(m[0]) : null; };
 
 // Drop and re-create airports table to cleanly capture codes from CSV
+console.log('[INIT] Setting up airports table...');
 db.exec(`
   DROP TABLE IF EXISTS airports;
   CREATE TABLE airports (
@@ -32,15 +36,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_airports_icao ON airports(icao);
 `);
 
-// Load and parse airports.csv
-try {
-  const airportFilePath = path.join(__dirname, 'data', 'airports.csv');
-  if (fs.existsSync(airportFilePath)) {
-    const fileContent = fs.readFileSync(airportFilePath, 'utf8');
-    const lines = fileContent.split(/\r?\n/);
-    
-    if (lines.length > 0) {
-      // Simple CSV line tokenizer handling quoted fields
+// Load and parse airports.csv efficiently if table is empty
+const airportCount = db.prepare('SELECT COUNT(*) AS c FROM airports').get().c;
+console.log(`[INIT] Current airports count in DB: ${airportCount}`);
+if (airportCount === 0) {
+  try {
+    const airportFilePath = path.join(__dirname, 'data', 'airports.csv');
+    console.log(`[INIT] Looking for CSV at: ${airportFilePath}`);
+    if (fs.existsSync(airportFilePath)) {
+      console.log('[INIT] Reading airports.csv contents into memory...');
+      const fileContent = fs.readFileSync(airportFilePath, 'utf8');
+      console.log(`[INIT] Successfully read airports.csv (${fileContent.length} bytes). Parsing headers...`);
+      
       const parseCSVLine = (line) => {
         const res = [];
         let cur = '', inQuotes = false;
@@ -54,18 +61,28 @@ try {
         return res.map(v => v.replace(/^"|"$/g, ''));
       };
 
-      const headers = parseCSVLine(lines[0]);
+      let headerLineEnd = fileContent.indexOf('\n');
+      const headers = parseCSVLine(fileContent.slice(0, headerLineEnd));
       const locIdIdx = headers.indexOf('Loc Id');
       const icaoIdx = headers.indexOf('ICAO Id');
       const latIdx = headers.indexOf('ARP Latitude DD');
       const lonIdx = headers.indexOf('ARP Longitude DD');
+      console.log(`[INIT] Column indices -> Loc Id: ${locIdIdx}, ICAO Id: ${icaoIdx}, Lat: ${latIdx}, Lon: ${lonIdx}`);
 
       if (latIdx !== -1 && lonIdx !== -1) {
         const insertAirport = db.prepare('INSERT OR IGNORE INTO airports (icao, lat, lon) VALUES (?, ?, ?)');
-        const insertMany = db.transaction((rows) => {
-          for (let i = 1; i < rows.length; i++) {
-            if (!rows[i]) continue;
-            const cols = parseCSVLine(rows[i]);
+        
+        let pos = headerLineEnd + 1;
+        console.log('[INIT] Starting database transaction loop for airport records...');
+        const insertBatch = db.transaction(() => {
+          while (pos < fileContent.length) {
+            let nextLineEnd = fileContent.indexOf('\n', pos);
+            if (nextLineEnd === -1) nextLineEnd = fileContent.length;
+            const line = fileContent.slice(pos, nextLineEnd).trim();
+            pos = nextLineEnd + 1;
+
+            if (!line) continue;
+            const cols = parseCSVLine(line);
             const lat = Number(cols[latIdx]);
             const lon = Number(cols[lonIdx]);
 
@@ -79,18 +96,18 @@ try {
             }
           }
         });
-        insertMany(lines);
+        
+        insertBatch();
         console.log(`[INIT] Loaded airport coordinates from airports.csv into database.`);
-      } else {
-        console.warn('[INIT] Could not find required lat/lon columns in airports.csv headers.');
       }
     }
+  } catch (err) {
+    console.warn('[INIT] Could not load airports.csv:', err.message);
   }
-} catch (err) {
-  console.warn('[INIT] Could not load airports.csv:', err.message);
 }
 
 const getAirportCoords = db.prepare('SELECT lat, lon FROM airports WHERE icao = ?');
+console.log('[INIT] Airport coordinate lookup prepared successfully.');
 
 const extractCoordinates = (mObj, rawText = '') => {
   // 1. Capture AIXM Polygons (gml:posList)
