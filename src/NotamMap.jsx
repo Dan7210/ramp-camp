@@ -8,10 +8,43 @@ import VectorSource from 'ol/source/Vector';
 import OSM from 'ol/source/OSM';
 import Feature from 'ol/Feature';
 import Point from 'ol/geom/Point';
-import CircularPolygon from 'ol/geom/Polygon';
+import { circular as circularPolygon } from 'ol/geom/Polygon';
 import Overlay from 'ol/Overlay';
 import { fromLonLat } from 'ol/proj';
 import { Style, Circle as CircleStyle, Fill, Stroke } from 'ol/style';
+
+// Helper function to parse ICAO format (e.g., "3526N08232W" or "333831N0842606W")
+function parseIcaoCoordinates(coordStr) {
+  if (typeof coordStr !== 'string') return null;
+
+  // Matches DDMM[SS]N/S and DDDMM[SS]E/W
+  const match = coordStr.match(/^(\d{2,6})([NS])(\d{3,7})([EW])$/i);
+  if (!match) return null;
+
+  const [, latStr, latDir, lonStr, lonDir] = match;
+
+  const parseDMS = (str) => {
+    if (str.length === 2 || str.length === 3) return parseFloat(str); // Degrees only
+    if (str.length === 4 || str.length === 5) {
+      const deg = parseFloat(str.slice(0, -2));
+      const min = parseFloat(str.slice(-2));
+      return deg + min / 60;
+    }
+    // Degrees, Minutes, Seconds
+    const deg = parseFloat(str.slice(0, -4));
+    const min = parseFloat(str.slice(-4, -2));
+    const sec = parseFloat(str.slice(-2));
+    return deg + min / 60 + sec / 360;
+  };
+
+  let lat = parseDMS(latStr);
+  let lon = parseDMS(lonStr);
+
+  if (latDir.toUpperCase() === 'S') lat = -lat;
+  if (lonDir.toUpperCase() === 'W') lon = -lon;
+
+  return { lat, lon };
+}
 
 export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
   const mapElement = useRef(null);
@@ -95,7 +128,7 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
     mapRef.current = initialMap;
 
     return () => initialMap.setTarget(null);
-  }, []);
+  }, [hoveredNotamId, onHoverNotam]);
 
   useEffect(() => {
     if (!mapRef.current) return;
@@ -104,40 +137,48 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
     const validCoords = [];
 
     notams.forEach((notam) => {
-      let rawLat = notam.lat ?? notam.latitude ?? notam.coordinates?.[0] ?? notam.coordinates?.[1];
-      let rawLon = notam.lon ?? notam.longitude ?? notam.coordinates?.[1] ?? notam.coordinates?.[0];
+      let lat = null;
+      let lon = null;
 
-      if (Array.isArray(notam.coordinates)) {
-        // If coordinate array has latitude in [0] and longitude in [1], swap them
-        if (Math.abs(notam.coordinates[0]) <= 90 && Math.abs(notam.coordinates[1]) > 90) {
-          rawLat = notam.coordinates[0];
-          rawLon = notam.coordinates[1];
-        } else {
-          rawLon = notam.coordinates[0];
-          rawLat = notam.coordinates[1];
+      // 1. Try parsing ICAO string (e.g., "3526N08232W")
+      if (typeof notam.coordinates === 'string') {
+        const parsed = parseIcaoCoordinates(notam.coordinates);
+        if (parsed) {
+          lat = parsed.lat;
+          lon = parsed.lon;
         }
+      } 
+      // 2. Try array format [lon, lat] or [lat, lon]
+      else if (Array.isArray(notam.coordinates) && notam.coordinates.length >= 2) {
+        lat = Number(notam.coordinates[1]);
+        lon = Number(notam.coordinates[0]);
+      } 
+      // 3. Try object properties
+      else if (notam.lat && notam.lng) {
+        lat = Number(notam.lat);
+        lon = Number(notam.lng);
       }
 
-      const lat = Number(rawLat);
-      const lon = Number(rawLon);
-
-      if (!isNaN(lat) && !isNaN(lon) && lat !== 0 && lon !== 0) {
-        // Ensure lat/lon aren't inverted (US Latitudes ~24 to 50, Longitudes ~-125 to -66)
+      // Ensure lat/lon aren't inverted (US Lat ~24-50, Lon ~ -125 to -66)
+      if (lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon)) {
         const finalLat = Math.abs(lat) > 90 ? lon : lat;
         const finalLon = Math.abs(lat) > 90 ? lat : lon;
 
         const centerCoords = fromLonLat([finalLon, finalLat]);
         validCoords.push(centerCoords);
 
-        const radiusMiles = notam.radiusMiles || notam.radius || 0;
+        const radiusMiles = notam.radiusNM || notam.radiusMiles || 0;
 
         if (radiusMiles > 0) {
-          const radiusMeters = radiusMiles * 1609.34;
+          // Convert Nautical Miles to Meters for map rendering (1 NM = 1852 meters)
+          const radiusMeters = radiusMiles * 1852;
+          const circleGeom = circularPolygon([finalLon, finalLat], radiusMeters, 64)
+            .transform('EPSG:4326', mapRef.current.getView().getProjection());
           const circleFeature = new Feature({
-            geometry: CircularPolygon.fromCircle(new Point(centerCoords).getGeometry(), radiusMeters),
+            geometry: circleGeom,
             id: notam.id,
             text: notam.text,
-            level: notam.level
+            level: notam.classification
           });
           vectorSourceRef.current.addFeature(circleFeature);
         } else {
@@ -145,7 +186,7 @@ export default function NotamMap({ notams, hoveredNotamId, onHoverNotam }) {
             geometry: new Point(centerCoords),
             id: notam.id,
             text: notam.text,
-            level: notam.level
+            level: notam.classification
           });
           vectorSourceRef.current.addFeature(pointFeature);
         }

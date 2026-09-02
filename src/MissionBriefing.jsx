@@ -423,7 +423,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
           body: JSON.stringify({
             origin: originCode,
             destination: destCode,
-            radius: 20
+            radius: 5
           })
         })
           .then(res => res.ok ? res.json() : Promise.reject(`HTTP ${res.status}`))
@@ -692,9 +692,9 @@ export default function MissionBriefing({ missionPlan, onBack }) {
               ) : filteredNotams.length === 0 ? (
                 <p className="empty-msg">No NOTAMs found for the selected category.</p>
               ) : (
-                filteredNotams.map((n) => (
+                filteredNotams.map((n, idx) => (
                   <div 
-                    key={n.id} 
+                    key={n.id && n.id !== 'N/A' ? `${n.id}_${idx}` : `notam_${idx}`} 
                     className={`notam-card notam-${n.level} ${hoveredNotamId === n.id ? 'notam-hovered' : ''}`}
                     onMouseEnter={() => setHoveredNotamId(n.id)}
                     onMouseLeave={() => setHoveredNotamId(null)}
