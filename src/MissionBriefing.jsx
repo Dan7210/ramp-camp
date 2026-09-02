@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect, useCallback } from 'react';
 import faaAirports from './airports.json';
 import './MissionBriefing.css';
 
@@ -12,6 +12,8 @@ const DEFAULT_PERFORMANCE = {
   descentGph: 6.5,
   descentFpm: 600
 };
+
+const NOTAM_ENDPOINT = 'https://adsb-radar.duckdns.org:3000/api/notams/route';
 
 const toNumber = (value) => Number(value) || 0;
 
@@ -190,7 +192,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
   const elev = apt?.elevationFeet || apt?.elevation || 0;
   const targetUtcDate = targetEtdIso ? new Date(targetEtdIso) : new Date();
 
-  // 1. Base State from METAR
   const metarData = parseMetar(rawMetar);
   
   const result = {
@@ -198,12 +199,7 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
     rawMetar: rawMetar || 'No METAR available',
     rawForecast: null,
     isStale: false,
-    sources: {
-      wind: 'METAR',
-      visibility: 'METAR',
-      ceiling: 'METAR',
-      densityAlt: 'METAR'
-    },
+    sources: { wind: 'METAR', visibility: 'METAR', ceiling: 'METAR', densityAlt: 'METAR' },
     windDir: metarData?.windDir || 0,
     windSpeed: metarData?.windSpeed || 0,
     windGust: metarData?.windGust || null,
@@ -225,7 +221,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
     if (diffMinutes > 30) result.isStale = true;
   }
 
-  // 2. Override forecastable items via TAF or MOS if available
   let activeForecastText = null;
   let forecastType = null;
 
@@ -240,7 +235,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
   if (activeForecastText) {
     result.rawForecast = `${forecastType}: ${activeForecastText.trim()}`;
 
-    // Supercede Wind
     const fWind = activeForecastText.match(/(VRB|\d{3})(\d{2,3})(G\d{2,3})?KT/);
     if (fWind) {
       result.windDir = fWind[1] === 'VRB' ? 0 : parseInt(fWind[1], 10);
@@ -250,7 +244,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
       result.sources.wind = forecastType;
     }
 
-    // Supercede Visibility
     const fVis = activeForecastText.match(/(P?\d+\/\d+|P?\d+)\s*SM/);
     if (fVis) {
       const v = fVis[1].replace('P', '');
@@ -258,7 +251,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
       result.sources.visibility = forecastType;
     }
 
-    // Supercede Ceiling
     const fClouds = [...activeForecastText.matchAll(/(BKN|OVC)(\d{3})/g)];
     if (fClouds.length > 0) {
       result.ceiling = Math.min(...fClouds.map(m => parseInt(m[2], 10) * 100));
@@ -269,7 +261,6 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
     }
   }
 
-  // Derived Calculations
   result.pressureAlt = Math.round(((29.92 - result.altimeter) * 1000) + elev);
   const isaTemp = 15 - (1.98 * (elev / 1000));
   result.densityAlt = Math.round(result.pressureAlt + (120 * (result.temp - isaTemp)));
@@ -286,6 +277,31 @@ const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
 const isDaytime = (date) => {
   const hours = date.getHours();
   return hours >= 6 && hours < 18;
+};
+
+// Helper for NOTAM classification and priority styling
+const categorizeNotam = (notam) => {
+  const text = (notam.text || '').toUpperCase();
+  
+  if (text.includes('TFR') || text.includes('RESTRICTED') || text.includes('PROHIBITED') || text.includes('SECURITY')) {
+    return { category: 'TFR / Airspace Constraints', level: 'critical', badge: 'RED' };
+  }
+  if (text.includes('RWY') || text.includes('RUNWAY') || text.includes('CLSD') || text.includes('CLOSED')) {
+    return { category: 'Runways & Aerodrome Ops', level: 'critical', badge: 'RED' };
+  }
+  if (text.includes('OBST') || text.includes('TOWER') || text.includes('CRANE') || text.includes('LIGHT')) {
+    return { category: 'Obstacles & Hazards', level: 'warning', badge: 'ORANGE' };
+  }
+  if (text.includes('NAV') || text.includes('ILS') || text.includes('VOR') || text.includes('GPS') || text.includes('WAAS') || text.includes('PROC')) {
+    return { category: 'Navigational Aids & Approaches', level: 'caution', badge: 'YELLOW' };
+  }
+  if (text.includes('TWY') || text.includes('TAXIWAY') || text.includes('APRON') || text.includes('RAMP')) {
+    return { category: 'Taxiways & Aprons', level: 'info', badge: 'BLUE' };
+  }
+  if (text.includes('SVC') || text.includes('FUEL') || text.includes('COM') || text.includes('TWR')) {
+    return { category: 'Services & Communications', level: 'info', badge: 'BLUE' };
+  }
+  return { category: 'General / Other', level: 'low', badge: 'GRAY' };
 };
 
 export default function MissionBriefing({ missionPlan, onBack }) {
@@ -308,6 +324,12 @@ export default function MissionBriefing({ missionPlan, onBack }) {
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState('');
   const [notamsReviewed, setNotamsReviewed] = useState(false);
+
+  // NOTAM State
+  const [notams, setNotams] = useState([]);
+  const [notamsLoading, setNotamsLoading] = useState(false);
+  const [notamsError, setNotamsError] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('ALL');
 
   const departureAirport = useMemo(() => findAirport(missionPlan.waypoints?.[0] || missionPlan.legs?.[0]?.start), [missionPlan]);
   const destinationAirport = useMemo(() => findAirport(missionPlan.waypoints.at(-1)), [missionPlan]);
@@ -386,6 +408,73 @@ export default function MissionBriefing({ missionPlan, onBack }) {
 
     return { rows, totalHours: baseHours, totalGallons: baseGallons + marginGallons, totalDist, marginGallons };
   }, [missionPlan.legs, performance, activeGasMargin]);
+
+  const fetchNotamsForLegs = useCallback(async () => {
+    if (!missionPlan.legs || missionPlan.legs.length === 0) return;
+
+    setNotamsLoading(true);
+    setNotamsError('');
+
+    try {
+      // Gather all leg fetches
+      const legPromises = missionPlan.legs.map((leg) => {
+        const originCode = leg.start?.icao || leg.start?.id || 'UNKNOWN';
+        const destCode = leg.end?.icao || leg.end?.id || 'UNKNOWN';
+
+        return fetch(NOTAM_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            origin: originCode,
+            destination: destCode,
+            radius: 20
+          })
+        })
+          .then(res => res.ok ? res.json() : Promise.reject(`HTTP ${res.status}`))
+          .then(data => data.notams || [])
+          .catch(err => {
+            console.warn(`Failed fetching NOTAMs for leg ${originCode}->${destCode}:`, err);
+            return [];
+          });
+      });
+
+      const results = await Promise.all(legPromises);
+      const flatNotams = results.flat();
+
+      // Deduplicate by ID and Text
+      const seen = new Set();
+      const uniqueNotams = [];
+
+      for (const item of flatNotams) {
+        const key = `${item.id || ''}_${item.text || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const meta = categorizeNotam(item);
+          uniqueNotams.push({ ...item, ...meta });
+        }
+      }
+
+      setNotams(uniqueNotams);
+    } catch {
+      setNotamsError('Error fetching NOTAMs from server endpoint.');
+    } finally {
+      setNotamsLoading(false);
+    }
+  }, [missionPlan.legs]);
+
+  useEffect(() => {
+    fetchNotamsForLegs();
+  }, [fetchNotamsForLegs]);
+
+  const categoriesList = useMemo(() => {
+    const cats = new Set(notams.map(n => n.category));
+    return ['ALL', ...Array.from(cats)];
+  }, [notams]);
+
+  const filteredNotams = useMemo(() => {
+    if (selectedCategory === 'ALL') return notams;
+    return notams.filter(n => n.category === selectedCategory);
+  }, [notams, selectedCategory]);
 
   const runwaySafety = useMemo(() => {
     const checks = [];
@@ -581,9 +670,56 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         </header>
 
         <section className="briefing-section notam-section">
-          <h3 className="section-h3">NOTAMs</h3>
-          <div className="notam-box">
-            <a href="https://notams.aim.faa.gov/notamSearch/" target="_blank" rel="noreferrer" className="btn-link">Open FAA NOTAM Search</a>
+          <div className="notam-header-controls">
+            <h3 className="section-h3" style={{ margin: 0 }}>Route NOTAMs ({filteredNotams.length})</h3>
+            
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+              <select 
+                className="notam-category-select"
+                value={selectedCategory} 
+                onChange={(e) => setSelectedCategory(e.target.value)}
+              >
+                {categoriesList.map(cat => (
+                  <option key={cat} value={cat}>{cat === 'ALL' ? 'All Categories' : cat}</option>
+                ))}
+              </select>
+
+              <button className="btn-refresh-sm" onClick={fetchNotamsForLegs} disabled={notamsLoading}>
+                {notamsLoading ? 'Fetching...' : 'Reload NOTAMs'}
+              </button>
+            </div>
+          </div>
+
+          {notamsError && <p className="briefing-error">{notamsError}</p>}
+
+          <div className="notam-scroll-container">
+            {notamsLoading ? (
+              <p className="empty-msg">Querying route corridors for active NOTAMs...</p>
+            ) : filteredNotams.length === 0 ? (
+              <p className="empty-msg">No NOTAMs found for the selected category.</p>
+            ) : (
+              filteredNotams.map((n, idx) => (
+                <div key={idx} className={`notam-card notam-${n.level}`}>
+                  <div className="notam-card-header">
+                    <div>
+                      <span className="notam-id">{n.id}</span>
+                      <span className="notam-facility">[{n.facility}]</span>
+                    </div>
+                    <span className={`notam-badge badge-${n.badge}`}>{n.category}</span>
+                  </div>
+                  <p className="notam-text">{n.text}</p>
+                  {(n.effectiveStart || n.effectiveEnd) && (
+                    <div className="notam-dates">
+                      Effective: {n.effectiveStart ? new Date(n.effectiveStart).toUTCString() : 'Immediate'} 
+                      {n.effectiveEnd ? ` ➔ ${new Date(n.effectiveEnd).toUTCString()}` : ' ➔ Permanent / UFN'}
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="notam-box" style={{ marginTop: '10px' }}>
             <label className="notam-check">
               <input type="checkbox" checked={notamsReviewed} onChange={(e) => setNotamsReviewed(e.target.checked)} />
               I have reviewed the applicable NOTAMs for this flight.
