@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect, useCallback } from 'react';
 import faaAirports from './airports.json';
+import NotamMap from './NotamMap';
 import './MissionBriefing.css';
 
 const DEFAULT_PERFORMANCE = {
@@ -46,7 +47,6 @@ const findAirport = (waypoint) => {
   return null;
 };
 
-// Calculate Minimum and Maximum Crosswind Components across all runways
 const calculateCrosswinds = (windDir, windSpeed, windGust, runways) => {
   if (windDir === null || windSpeed === null) return { min: 0, max: 0 };
   const maxVelocity = windSpeed + (windGust ? (windGust - windSpeed) : 0);
@@ -80,7 +80,6 @@ const calculateCrosswinds = (windDir, windSpeed, windGust, runways) => {
   };
 };
 
-// FAA Flight Category Evaluator
 const evaluateFlightCategory = (ceilingFeet, visibilitySm) => {
   const c = ceilingFeet !== null ? ceilingFeet : Infinity;
   const v = visibilitySm !== null ? visibilitySm : Infinity;
@@ -112,7 +111,6 @@ const evaluateFlightCategory = (ceilingFeet, visibilitySm) => {
   return { category, reason: reason.join(' & ') };
 };
 
-// Extracts active TAF group matching target UTC (Zulu) timestamp
 const extractActiveTafSegment = (rawTaf, targetUtcDate) => {
   if (!rawTaf) return rawTaf;
   const targetTime = targetUtcDate.getTime();
@@ -134,7 +132,6 @@ const extractActiveTafSegment = (rawTaf, targetUtcDate) => {
   return selectedGroup;
 };
 
-// Parse raw METAR line
 const parseMetar = (rawText) => {
   if (!rawText) return null;
   const res = {
@@ -187,7 +184,6 @@ const parseMetar = (rawText) => {
   return res;
 };
 
-// Blends METAR base with superceding TAF/MOS forecasts
 const buildBlendedWeather = (apt, rawMetar, rawTaf, rawMos, targetEtdIso) => {
   const elev = apt?.elevationFeet || apt?.elevation || 0;
   const targetUtcDate = targetEtdIso ? new Date(targetEtdIso) : new Date();
@@ -279,29 +275,29 @@ const isDaytime = (date) => {
   return hours >= 6 && hours < 18;
 };
 
-// Helper for NOTAM classification and priority styling
+// NOTAM classification and priority ordering
 const categorizeNotam = (notam) => {
   const text = (notam.text || '').toUpperCase();
   
   if (text.includes('TFR') || text.includes('RESTRICTED') || text.includes('PROHIBITED') || text.includes('SECURITY')) {
-    return { category: 'TFR / Airspace Constraints', level: 'critical', badge: 'RED' };
+    return { category: 'TFR / Airspace Constraints', level: 'critical', badge: 'RED', priority: 1 };
   }
   if (text.includes('RWY') || text.includes('RUNWAY') || text.includes('CLSD') || text.includes('CLOSED')) {
-    return { category: 'Runways & Aerodrome Ops', level: 'critical', badge: 'RED' };
+    return { category: 'Runways & Aerodrome Ops', level: 'critical', badge: 'RED', priority: 2 };
   }
   if (text.includes('OBST') || text.includes('TOWER') || text.includes('CRANE') || text.includes('LIGHT')) {
-    return { category: 'Obstacles & Hazards', level: 'warning', badge: 'ORANGE' };
+    return { category: 'Obstacles & Hazards', level: 'warning', badge: 'ORANGE', priority: 3 };
   }
   if (text.includes('NAV') || text.includes('ILS') || text.includes('VOR') || text.includes('GPS') || text.includes('WAAS') || text.includes('PROC')) {
-    return { category: 'Navigational Aids & Approaches', level: 'caution', badge: 'YELLOW' };
+    return { category: 'Navigational Aids & Approaches', level: 'caution', badge: 'YELLOW', priority: 4 };
   }
   if (text.includes('TWY') || text.includes('TAXIWAY') || text.includes('APRON') || text.includes('RAMP')) {
-    return { category: 'Taxiways & Aprons', level: 'info', badge: 'BLUE' };
+    return { category: 'Taxiways & Aprons', level: 'info', badge: 'BLUE', priority: 5 };
   }
   if (text.includes('SVC') || text.includes('FUEL') || text.includes('COM') || text.includes('TWR')) {
-    return { category: 'Services & Communications', level: 'info', badge: 'BLUE' };
+    return { category: 'Services & Communications', level: 'info', badge: 'BLUE', priority: 6 };
   }
-  return { category: 'General / Other', level: 'low', badge: 'GRAY' };
+  return { category: 'General / Other', level: 'low', badge: 'GRAY', priority: 7 };
 };
 
 export default function MissionBriefing({ missionPlan, onBack }) {
@@ -330,6 +326,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
   const [notamsLoading, setNotamsLoading] = useState(false);
   const [notamsError, setNotamsError] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('ALL');
+  const [hoveredNotamId, setHoveredNotamId] = useState(null);
 
   const departureAirport = useMemo(() => findAirport(missionPlan.waypoints?.[0] || missionPlan.legs?.[0]?.start), [missionPlan]);
   const destinationAirport = useMemo(() => findAirport(missionPlan.waypoints.at(-1)), [missionPlan]);
@@ -416,7 +413,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     setNotamsError('');
 
     try {
-      // Gather all leg fetches
       const legPromises = missionPlan.legs.map((leg) => {
         const originCode = leg.start?.icao || leg.start?.id || 'UNKNOWN';
         const destCode = leg.end?.icao || leg.end?.id || 'UNKNOWN';
@@ -441,7 +437,6 @@ export default function MissionBriefing({ missionPlan, onBack }) {
       const results = await Promise.all(legPromises);
       const flatNotams = results.flat();
 
-      // Deduplicate by ID and Text
       const seen = new Set();
       const uniqueNotams = [];
 
@@ -453,6 +448,9 @@ export default function MissionBriefing({ missionPlan, onBack }) {
           uniqueNotams.push({ ...item, ...meta });
         }
       }
+
+      // Sort by highest priority (TFRs first, Obstacles second, General lower)
+      uniqueNotams.sort((a, b) => a.priority - b.priority);
 
       setNotams(uniqueNotams);
     } catch {
@@ -488,7 +486,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
       checks.push({
         name: airport.icao || airport.id,
         type,
-        status: isSufficient ? '✅ Sufficient' : '❌ Insufficient',
+        status: isSufficient ? 'Sufficient' : 'Insufficient',
         isError: !isSufficient
       });
     };
@@ -582,7 +580,8 @@ export default function MissionBriefing({ missionPlan, onBack }) {
     <div className="nwkraft-page">
       <aside className="nwkraft-sidebar">
         <h2 className="brand">RampCamp</h2>
-        <button type="button" className="btn-back" onClick={onBack}>← Back</button>
+        <p>For General Aviation and Camping enthusiasts.</p>
+        <button type="button" className="btn-back" onClick={onBack}>← Back to Route & Altitude Selection</button>
 
         <label className="briefing-label">
           ETD (Local)
@@ -655,18 +654,12 @@ export default function MissionBriefing({ missionPlan, onBack }) {
             )}
           </div>
         </section>
-
-        <section className="briefing-section">
-          <button type="button" className="btn-plan-sm" onClick={loadWeather} disabled={weatherLoading}>
-            {weatherLoading ? 'Updating Weather...' : 'Refresh Weather'}
-          </button>
-        </section>
       </aside>
 
       <main className="nwkraft-content">
         <header>
           <h1>NWKRAFT Mission Briefing</h1>
-          <p>ETD Target UTC: {new Date(etd).toISOString().replace('.000', '')} | NOTAM Review: {notamsReviewed ? '✅' : '❌'}</p>
+          <p>ETD Target UTC: {new Date(etd).toISOString().replace('.000', '')} | NOTAM Review: {notamsReviewed ? 'Reviewed' : 'Pending'}</p>
         </header>
 
         <section className="briefing-section notam-section">
@@ -692,31 +685,46 @@ export default function MissionBriefing({ missionPlan, onBack }) {
 
           {notamsError && <p className="briefing-error">{notamsError}</p>}
 
-          <div className="notam-scroll-container">
-            {notamsLoading ? (
-              <p className="empty-msg">Querying route corridors for active NOTAMs...</p>
-            ) : filteredNotams.length === 0 ? (
-              <p className="empty-msg">No NOTAMs found for the selected category.</p>
-            ) : (
-              filteredNotams.map((n, idx) => (
-                <div key={idx} className={`notam-card notam-${n.level}`}>
-                  <div className="notam-card-header">
-                    <div>
-                      <span className="notam-id">{n.id}</span>
-                      <span className="notam-facility">[{n.facility}]</span>
+          <div className="notam-split-container">
+            <div className="notam-scroll-container">
+              {notamsLoading ? (
+                <p className="empty-msg">Querying route corridors for active NOTAMs...</p>
+              ) : filteredNotams.length === 0 ? (
+                <p className="empty-msg">No NOTAMs found for the selected category.</p>
+              ) : (
+                filteredNotams.map((n) => (
+                  <div 
+                    key={n.id} 
+                    className={`notam-card notam-${n.level} ${hoveredNotamId === n.id ? 'notam-hovered' : ''}`}
+                    onMouseEnter={() => setHoveredNotamId(n.id)}
+                    onMouseLeave={() => setHoveredNotamId(null)}
+                  >
+                    <div className="notam-card-header">
+                      <div>
+                        <span className="notam-id">{n.id}</span>
+                        <span className="notam-facility">[{n.facility}]</span>
+                      </div>
+                      <span className={`notam-badge badge-${n.badge}`}>{n.category}</span>
                     </div>
-                    <span className={`notam-badge badge-${n.badge}`}>{n.category}</span>
+                    <p className="notam-text">{n.text}</p>
+                    {(n.effectiveStart || n.effectiveEnd) && (
+                      <div className="notam-dates">
+                        Effective: {n.effectiveStart ? new Date(n.effectiveStart).toUTCString() : 'Immediate'} 
+                        {n.effectiveEnd ? ` ➔ ${new Date(n.effectiveEnd).toUTCString()}` : ' ➔ Permanent / UFN'}
+                      </div>
+                    )}
                   </div>
-                  <p className="notam-text">{n.text}</p>
-                  {(n.effectiveStart || n.effectiveEnd) && (
-                    <div className="notam-dates">
-                      Effective: {n.effectiveStart ? new Date(n.effectiveStart).toUTCString() : 'Immediate'} 
-                      {n.effectiveEnd ? ` ➔ ${new Date(n.effectiveEnd).toUTCString()}` : ' ➔ Permanent / UFN'}
-                    </div>
-                  )}
-                </div>
-              ))
-            )}
+                ))
+              )}
+            </div>
+
+            <div className="notam-map-wrapper">
+              <NotamMap 
+                notams={filteredNotams} 
+                hoveredNotamId={hoveredNotamId} 
+                onHoverNotam={setHoveredNotamId} 
+              />
+            </div>
           </div>
 
           <div className="notam-box" style={{ marginTop: '10px' }}>
@@ -728,44 +736,49 @@ export default function MissionBriefing({ missionPlan, onBack }) {
         </section>
 
         <section className="briefing-section">
-          <h3 className="section-h3">Terminal Weather Breakdown</h3>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <h3 className="section-h3" style={{ margin: 0 }}>Terminal Weather Breakdown</h3>
+            <button type="button" className="btn-refresh-sm2" onClick={loadWeather} disabled={weatherLoading}>
+              {weatherLoading ? 'Updating...' : 'Refresh Weather'}
+            </button>
+          </div>
+
           {weatherError && <p className="briefing-error">{weatherError}</p>}
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '10px' }}>
             {weather.reports.length > 0 ? (
               weather.reports.map((m, i) => (
-                <div key={i} style={{ background: '#1e293b', padding: '16px', borderRadius: '8px', border: '1px solid #334155' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                    <strong>{m.role}: {m.icao}</strong>
+                <div key={i} className="weather-card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                    <strong style={{ fontSize: '13px' }}>{m.role}: {m.icao}</strong>
                     <span className={`cat-badge ${getCategoryClass(m.flightCategory.category)}`}>
                       {m.flightCategory.category}
                     </span>
                   </div>
 
                   {m.isStale && (
-                    <div style={{ background: '#78350f', color: '#fef08a', padding: '4px 8px', borderRadius: '4px', fontSize: '11px', marginBottom: '8px' }}>
-                      ⚠️ METAR &gt;30m past observation time.
+                    <div style={{ background: '#78350f', color: '#fef08a', padding: '2px 6px', borderRadius: '4px', fontSize: '10px', marginBottom: '6px' }}>
+                      METAR &gt;30m past observation time.
                     </div>
                   )}
 
-                  <div style={{ fontSize: '13px', display: 'grid', gap: '6px' }}>
+                  <div className="weather-details-grid">
                     <p><strong>Reason:</strong> {m.flightCategory.reason}</p>
-                    <p>🌬️ <strong>Wind:</strong> {m.windStr} <span className="source-tag">[{m.sources.wind}]</span></p>
-                    <p>📐 <strong>Crosswind Range:</strong> {m.minCrosswind} kt (Min) — {m.maxCrosswind} kt (Max)</p>
-                    <p>👁️ <strong>Visibility:</strong> {m.visibility} SM <span className="source-tag">[{m.sources.visibility}]</span></p>
-                    <p>☁️ <strong>Ceiling:</strong> {m.ceiling ? `${m.ceiling} ft` : 'CLR/Unlimited'} <span className="source-tag">[{m.sources.ceiling}]</span></p>
-                    <p>🌡️ <strong>Temp / Dewpoint:</strong> {m.temp}°C / {m.dewpoint}°C <span className="source-tag">[METAR]</span></p>
-                    <p>🎚️ <strong>Altimeter:</strong> {m.altimeter.toFixed(2)} inHg <span className="source-tag">[METAR]</span></p>
+                    <p><strong>Wind:</strong> {m.windStr} <span className="source-tag">[{m.sources.wind}]</span></p>
+                    <p><strong>Crosswind:</strong> {m.minCrosswind} kt (Min) — {m.maxCrosswind} kt (Max)</p>
+                    <p><strong>Visibility:</strong> {m.visibility} SM <span className="source-tag">[{m.sources.visibility}]</span></p>
+                    <p><strong>Ceiling:</strong> {m.ceiling ? `${m.ceiling} ft` : 'CLR/Unlimited'} <span className="source-tag">[{m.sources.ceiling}]</span></p>
+                    <p><strong>Temp / Dewpoint:</strong> {m.temp}°C / {m.dewpoint}°C | <strong>Alt:</strong> {m.altimeter.toFixed(2)} inHg</p>
 
-                    <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'space-between' }}>
+                    <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'space-between', fontSize: '11px' }}>
                       <span>P-Alt: <strong>{m.pressureAlt.toLocaleString()}'</strong></span>
                       <span>D-Alt: <strong>{m.densityAlt.toLocaleString()}'</strong></span>
                     </div>
                   </div>
 
-                  <div style={{ marginTop: '10px', fontSize: '11px', background: '#0f172a', padding: '6px', borderRadius: '4px', overflowX: 'auto' }}>
+                  <div className="weather-raw-code">
                     <code>METAR: {m.rawMetar}</code>
-                    {m.rawForecast && <code style={{ display: 'block', marginTop: '4px', color: '#38bdf8' }}>{m.rawForecast}</code>}
+                    {m.rawForecast && <code style={{ display: 'block', marginTop: '2px', color: '#38bdf8' }}>{m.rawForecast}</code>}
                   </div>
                 </div>
               ))
@@ -815,7 +828,7 @@ export default function MissionBriefing({ missionPlan, onBack }) {
               <tbody>
                 {fuelPlan.rows.map((leg, index) => (
                   <tr key={leg.id}>
-                    <td>{index + 1}. {leg.start.name} ➡️ {leg.end.name} ({leg.end.icao})</td>
+                    <td>{index + 1}. {leg.start.name} -&gt; {leg.end.name} ({leg.end.icao})</td>
                     <td>{Number(leg.selectedMslFeet).toLocaleString()} ft</td>
                     <td>{leg.distNM.toFixed(1)} NM</td>
                     <td className="small-text">+{leg.climbFeet.toLocaleString()}<br/>−{leg.descentFeet.toLocaleString()}</td>

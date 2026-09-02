@@ -274,7 +274,7 @@ function normalizeAixmNotam(parsedXml) {
 
 app.post('/api/notams/route', async (req, res) => {
   try {
-    const { origin, destination, waypoints = [], radius = 20 } = req.body;
+    const { origin, destination, waypoints = [], radius = 5 } = req.body;
 
     if (!origin || !destination) {
       return res.status(400).json({ error: 'Both "origin" and "destination" are required.' });

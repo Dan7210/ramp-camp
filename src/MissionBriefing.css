@@ -130,23 +130,39 @@
   font-size: 0.8rem;
 }
 
+.btn-refresh-sm2 {
+  padding: 0.4rem 0.6rem;
+  background: #0284c7;
+  color: #f8fafc;
+  border: 1px solid #0ea5e9;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
 .btn-refresh-sm:hover:not(:disabled) {
   background: #475569;
 }
 
-/* Fixed Height Container (~1/3 of view height) */
-.notam-scroll-container {
-  height: 28vh;
-  min-height: 200px;
-  overflow-y: auto;
+.notam-split-container {
   display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding-right: 0.4rem;
-  background: #0f172a;
-  padding: 0.6rem;
+  gap: 12px;
+  height: 320px;
+  width: 100%;
+}
+
+.notam-scroll-container {
+  flex: 1;
+  height: 100%;
+}
+
+.notam-map-wrapper {
+  flex: 1;
+  height: 100%;
+  min-height: 200px;
   border-radius: 6px;
   border: 1px solid #334155;
+  overflow: hidden;
 }
 
 .notam-scroll-container::-webkit-scrollbar {
@@ -161,12 +177,9 @@
 }
 
 /* NOTAM Card Styles & Color-Coding */
-.notam-card {
-  padding: 0.6rem 0.75rem;
-  border-radius: 4px;
-  background: #1e293b;
-  border-left: 4px solid #94a3b8;
-  font-size: 0.8rem;
+.notam-card.notam-hovered {
+  border-left: 4px solid #38bdf8;
+  background: #334155 !important;
 }
 
 .notam-critical {
@@ -230,28 +243,90 @@
   white-space: pre-wrap;
 }
 
+.notam-section {
+  overflow: hidden;
+}
+
 .notam-dates {
   margin-top: 0.3rem;
   font-size: 0.7rem;
   color: #94a3b8;
 }
 
-@media (max-width: 800px) { 
-  .nwkraft-page { 
-    flex-direction: column; 
+.notam-split-container {
+  display: flex;
+  gap: 16px;
+  height: 420px; /* Increased height for better view */
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.notam-scroll-container {
+  flex: 1;
+  height: 100%;
+  overflow-y: auto; /* Contain scroll inside NOTAM list */
+  padding-right: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.notam-map-wrapper {
+  flex: 1;
+  height: 100%;
+  min-height: 250px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  overflow: hidden;
+}
+
+.notam-card {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 10px 12px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.weather-card {
+  background: #1e293b;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+}
+
+.weather-details-grid {
+  font-size: 12px;
+  line-height: 1.35;
+  display: grid;
+  gap: 3px;
+}
+
+.weather-details-grid p {
+  margin: 0;
+}
+
+.weather-raw-code {
+  margin-top: 6px;
+  font-size: 10.5px;
+  background: #0f172a;
+  padding: 4px 6px;
+  border-radius: 4px;
+  overflow-x: auto;
+  line-height: 1.25;
+}
+
+@media (max-width: 900px) {
+  .notam-split-container {
+    flex-direction: column;
     height: auto;
-    max-height: none;
-    overflow: auto;
-  } 
-  .nwkraft-sidebar { 
-    width: 100%; 
-    min-width: 0; 
-    height: auto;
-    border-right: 0; 
-    border-bottom: 1px solid #334155; 
-  } 
-  .nwkraft-content { 
-    height: auto;
-    padding: 1rem; 
-  } 
+  }
+  .notam-scroll-container {
+    height: 300px;
+  }
+  .notam-map-wrapper {
+    height: 280px;
+  }
 }
